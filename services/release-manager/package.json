@@ -14,5 +14,6 @@
   "devDependencies": {
     "tsx": "*",
     "typescript": "*"
-  }
+  },
+  "type": "module"
 }
