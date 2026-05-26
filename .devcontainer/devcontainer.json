@@ -1,7 +1,7 @@
 {
   "name": "blin",
   "image": "mcr.microsoft.com/devcontainers/typescript-node:20",
-  "postCreateCommand": "npm install",
+  "postCreateCommand": "npm install && npm install -g @anthropic-ai/claude-code",
   "forwardPorts": [3000],
   "portsAttributes": {
     "3000": {
@@ -13,7 +13,8 @@
     "vscode": {
       "extensions": [
         "dbaeumer.vscode-eslint",
-        "esbenp.prettier-vscode"
+        "esbenp.prettier-vscode",
+        "anthropic.claude-code"
       ]
     }
   }
