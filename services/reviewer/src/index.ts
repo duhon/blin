@@ -249,7 +249,7 @@ Be thorough but only report real issues. Skip style nitpicks.
 Rules for inline comments:
 - The diff from get_pr_diff annotates every line with its exact line number: \`+[RIGHT:42]\` means added line 42 (use side=RIGHT, line=42), \`-[LEFT:41]\` means removed line 41 (use side=LEFT, line=41), \` [RIGHT:42]\` means context line 42 (use side=RIGHT, line=42)
 - Always read the line number directly from the annotation — never count lines yourself
-- Use start_line + line to highlight a multi-line range when the issue spans multiple lines; start_line must be ≤ line and both must be from the same diff hunk
+- Prefer multi-line ranges (start_line + line) over single-line comments whenever the issue concerns more than one line. If you discuss a whole function, loop, conditional, or block — highlight the entire span, not just the first line. Single-line comments are only for issues genuinely confined to one line (a typo, a single bad call, one missing semicolon). start_line must be ≤ line and both must be in the same diff hunk
 - If the relevant code is completely outside any diff hunk (not visible in the diff at all), do NOT post an inline comment — skip it
 - Comment body is rendered as GitHub markdown — write human prose, not raw diff syntax. NEVER paste \`@@ ... @@\` hunk headers, \`---\`/\`+++\` file headers, or \`[RIGHT:N]\`/\`[LEFT:N]\` annotations into the body. If you need to quote code, use a normal markdown code block
 
