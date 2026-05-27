@@ -251,6 +251,7 @@ Rules for inline comments:
 - Always read the line number directly from the annotation — never count lines yourself
 - Use start_line + line to highlight a multi-line range when the issue spans multiple lines; start_line must be ≤ line and both must be from the same diff hunk
 - If the relevant code is completely outside any diff hunk (not visible in the diff at all), do NOT post an inline comment — skip it
+- Comment body is rendered as GitHub markdown — write human prose, not raw diff syntax. NEVER paste \`@@ ... @@\` hunk headers, \`---\`/\`+++\` file headers, or \`[RIGHT:N]\`/\`[LEFT:N]\` annotations into the body. If you need to quote code, use a normal markdown code block
 
 When done reviewing, say "Review complete." and stop calling tools.`;
 
