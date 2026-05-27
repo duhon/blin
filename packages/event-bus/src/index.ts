@@ -1,4 +1,3 @@
-import { EventEmitter } from 'events';
 import type { BlinEvent, EventType } from './events.js';
 
 export * from './events.js';
@@ -11,18 +10,22 @@ export interface IEventBus {
 }
 
 export class InMemoryEventBus implements IEventBus {
-  private emitter = new EventEmitter();
+  private handlers = new Map<string, EventHandler<any>[]>();
 
   async publish(event: BlinEvent): Promise<void> {
     console.log(`[event-bus] publish: ${event.type}`);
-    this.emitter.emit(event.type, event);
+    const handlers = this.handlers.get(event.type) ?? [];
+    await Promise.all(
+      handlers.map(h =>
+        Promise.resolve(h(event)).catch(err => {
+          console.error(`[event-bus] handler error for ${event.type}:`, err);
+        })
+      )
+    );
   }
 
   subscribe<T extends BlinEvent>(type: EventType, handler: EventHandler<T>): void {
-    this.emitter.on(type, (event: T) => {
-      Promise.resolve(handler(event)).catch((err) => {
-        console.error(`[event-bus] handler error for ${type}:`, err);
-      });
-    });
+    const existing = this.handlers.get(type) ?? [];
+    this.handlers.set(type, [...existing, handler]);
   }
 }
