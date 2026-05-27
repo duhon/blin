@@ -6,6 +6,24 @@ GitHub App for automated developer workflow.
 
 A GitHub App that automates routine developer tasks — code review, testing, releases, and preview environments. Each capability is handled by a dedicated service that can be configured per repository.
 
+## Getting started
+
+1. Install the [blin-bot](https://github.com/apps/blin-bot) GitHub App on your repository
+2. Optionally create `.github/blin.yml` to configure blin for your repo:
+
+```yaml
+reviewer:
+  enabled: true
+  knowledge:
+    - magento   # enable Magento 2 knowledge pack
+  context_files:
+    - .github/CONVENTIONS.md   # project-specific conventions
+```
+
+That's it. Add yourself as a reviewer on any PR — blin will post an inline code review.
+
+---
+
 ## Architecture
 
 ```
