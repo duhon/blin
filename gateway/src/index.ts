@@ -1,3 +1,4 @@
+import 'dotenv/config';
 import express from 'express';
 import { App } from '@octokit/app';
 import { Webhooks } from '@octokit/webhooks';

@@ -1,7 +1,7 @@
 import { EventEmitter } from 'events';
-import type { BlinEvent, EventType } from './events';
+import type { BlinEvent, EventType } from './events.js';
 
-export * from './events';
+export * from './events.js';
 
 type EventHandler<T extends BlinEvent> = (event: T) => Promise<void> | void;
 
