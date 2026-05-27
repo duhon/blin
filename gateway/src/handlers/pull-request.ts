@@ -3,6 +3,7 @@ import type { EmitterWebhookEvent } from '@octokit/webhooks';
 
 type PullRequestEvent = EmitterWebhookEvent<'pull_request'>;
 type PullRequestReviewCommentEvent = EmitterWebhookEvent<'pull_request_review_comment'>;
+type IssueCommentEvent = EmitterWebhookEvent<'issue_comment'>;
 
 function extractRepo(payload: PullRequestEvent['payload']) {
   return {
@@ -29,6 +30,9 @@ export async function handlePullRequest(
   const { payload } = event;
 
   if (payload.action === 'review_requested') {
+    const requested = (payload as any).requested_reviewer?.login ?? '';
+    if (requested !== 'duhon') return;
+
     const reviewEvent: ReviewRequestedEvent = {
       type: 'review.requested',
       repo: extractRepo(payload),
@@ -53,6 +57,40 @@ export async function handlePullRequest(
   }
 }
 
+export async function handleIssueComment(
+  event: IssueCommentEvent,
+  bus: IEventBus
+): Promise<void> {
+  const { payload } = event;
+
+  if (payload.action !== 'created') return;
+  if (!payload.comment.user || payload.comment.user.type === 'Bot') return;
+  if (!payload.issue.pull_request) return;
+
+  const trigger = '@duhon review';
+  if (!payload.comment.body.toLowerCase().includes(trigger)) return;
+
+  const reviewEvent: ReviewRequestedEvent = {
+    type: 'review.requested',
+    repo: {
+      owner: payload.repository.owner.login,
+      name: payload.repository.name,
+      fullName: payload.repository.full_name,
+    },
+    pr: {
+      number: payload.issue.number,
+      title: payload.issue.title,
+      body: payload.issue.body ?? null,
+      base: '',
+      head: '',
+    },
+    requestedBy: payload.comment.user.login,
+    installationId: payload.installation!.id,
+  };
+
+  await bus.publish(reviewEvent);
+}
+
 export async function handleReviewComment(
   event: PullRequestReviewCommentEvent,
   bus: IEventBus
@@ -60,11 +98,12 @@ export async function handleReviewComment(
   const { payload } = event;
 
   if (payload.action !== 'created') return;
-  if (payload.comment.user.type === 'Bot') return;
+  if (!payload.comment.user || payload.comment.user.type === 'Bot') return;
 
   const botMention = '@blin-bot';
   if (!payload.comment.body.includes(botMention)) return;
 
+  const pr = payload.pull_request as unknown as PullRequestEvent['payload']['pull_request'];
   const analystEvent: AnalystQuestionAskedEvent = {
     type: 'analyst.question_asked',
     repo: {
@@ -72,7 +111,7 @@ export async function handleReviewComment(
       name: payload.repository.name,
       fullName: payload.repository.full_name,
     },
-    pr: extractPr(payload.pull_request),
+    pr: extractPr(pr),
     commentId: payload.comment.id,
     question: payload.comment.body.replace(botMention, '').trim(),
     askedBy: payload.comment.user.login,

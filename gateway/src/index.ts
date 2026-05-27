@@ -3,7 +3,7 @@ import express from 'express';
 import { App } from '@octokit/app';
 import { Webhooks } from '@octokit/webhooks';
 import { InMemoryEventBus } from '@blin/event-bus';
-import { registerWebhookHandlers } from './router';
+import { registerWebhookHandlers } from './router.js';
 import { register as registerReviewer } from '@blin/reviewer';
 import { register as registerAnalyst } from '@blin/analyst';
 import { register as registerTester } from '@blin/tester';
