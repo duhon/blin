@@ -50,7 +50,12 @@ async function callBedrock(
 }
 
 type HunkRange = { start: number; end: number };
-type FileHunks = { rightHunks: HunkRange[]; leftHunks: HunkRange[] };
+type FileHunks = {
+  rightHunks: HunkRange[];
+  leftHunks: HunkRange[];
+  rightLines: Map<number, string>;
+  leftLines: Map<number, string>;
+};
 type DiffMap = Map<string, FileHunks>;
 
 function processDiff(diff: string): { annotated: string; map: DiffMap } {
@@ -80,7 +85,12 @@ function processDiff(diff: string): { annotated: string; map: DiffMap } {
       const m = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
       currentFile = m ? m[2] : null;
       if (currentFile) {
-        currentFileHunks = { rightHunks: [], leftHunks: [] };
+        currentFileHunks = {
+          rightHunks: [],
+          leftHunks: [],
+          rightLines: new Map(),
+          leftLines: new Map(),
+        };
         map.set(currentFile, currentFileHunks);
       } else {
         currentFileHunks = null;
@@ -97,19 +107,28 @@ function processDiff(diff: string): { annotated: string; map: DiffMap } {
     } else if (line.startsWith('+++') || line.startsWith('---')) {
       result.push(line);
     } else if (line.startsWith('+')) {
-      result.push(`+[RIGHT:${newLine}] ${line.slice(1)}`);
+      const content = line.slice(1);
+      result.push(`+[RIGHT:${newLine}] ${content}`);
+      if (currentFileHunks) currentFileHunks.rightLines.set(newLine, content);
       if (!rightHunk) rightHunk = { start: newLine, end: newLine };
       else rightHunk.end = newLine;
       newLine++;
     } else if (line.startsWith('-')) {
-      result.push(`-[LEFT:${oldLine}] ${line.slice(1)}`);
+      const content = line.slice(1);
+      result.push(`-[LEFT:${oldLine}] ${content}`);
+      if (currentFileHunks) currentFileHunks.leftLines.set(oldLine, content);
       if (!leftHunk) leftHunk = { start: oldLine, end: oldLine };
       else leftHunk.end = oldLine;
       oldLine++;
     } else if (line.startsWith('\\')) {
       result.push(line);
     } else if (line.startsWith(' ')) {
-      result.push(` [RIGHT:${newLine}] ${line.slice(1)}`);
+      const content = line.slice(1);
+      result.push(` [RIGHT:${newLine}] ${content}`);
+      if (currentFileHunks) {
+        currentFileHunks.rightLines.set(newLine, content);
+        currentFileHunks.leftLines.set(oldLine, content);
+      }
       if (!rightHunk) rightHunk = { start: newLine, end: newLine };
       else rightHunk.end = newLine;
       if (!leftHunk) leftHunk = { start: oldLine, end: oldLine };
@@ -130,7 +149,8 @@ function validateCommentLine(
   path: string,
   side: 'RIGHT' | 'LEFT',
   line: number,
-  startLine?: number
+  startLine: number | undefined,
+  anchorExcerpt: string
 ): string | null {
   const file = map.get(path);
   if (!file) {
@@ -151,6 +171,19 @@ function validateCommentLine(
     if (startLine < target.start || startLine > target.end) {
       return `start_line ${startLine} must be in the same hunk as line ${line} (hunk: ${target.start}-${target.end})`;
     }
+  }
+
+  const lineMap = side === 'RIGHT' ? file.rightLines : file.leftLines;
+  const anchorLine = startLine ?? line;
+  const actualContent = lineMap.get(anchorLine);
+  if (actualContent === undefined) {
+    return `Line ${anchorLine} on side ${side} has no recorded content for "${path}".`;
+  }
+  const normalize = (s: string) => s.replace(/\s+/g, ' ').trim();
+  const actualNorm = normalize(actualContent);
+  const expectedNorm = normalize(anchorExcerpt);
+  if (actualNorm !== expectedNorm) {
+    return `anchor_excerpt does not match line ${anchorLine} on side ${side} of "${path}".\n  expected: ${JSON.stringify(expectedNorm)}\n  actual:   ${JSON.stringify(actualNorm)}\nPick the line whose content matches the code you want to comment on.`;
   }
   return null;
 }
@@ -219,8 +252,12 @@ const TOOLS = [
               type: 'string',
               description: 'Comment text. For code suggestions use: ```suggestion\\nreplacement code\\n```',
             },
+            anchor_excerpt: {
+              type: 'string',
+              description: 'The exact text content (without the [RIGHT:N]/[LEFT:N] prefix or leading +/- ) of the anchor line — start_line if set, otherwise line. Used to verify you picked the right line. Whitespace is normalized.',
+            },
           },
-          required: ['path', 'line', 'body'],
+          required: ['path', 'line', 'body', 'anchor_excerpt'],
         },
       },
     },
@@ -249,6 +286,8 @@ Be thorough but only report real issues. Skip style nitpicks.
 Rules for inline comments:
 - The diff from get_pr_diff annotates every line with its exact line number: \`+[RIGHT:42]\` means added line 42 (use side=RIGHT, line=42), \`-[LEFT:41]\` means removed line 41 (use side=LEFT, line=41), \` [RIGHT:42]\` means context line 42 (use side=RIGHT, line=42)
 - Always read the line number directly from the annotation — never count lines yourself
+- The anchor line is the line your comment is attached to (start_line if you use a range, otherwise line). It must be the line containing the actual code you are discussing — not a docblock above it, not a closing brace below, not the first line of the hunk. Find the exact line whose content is what your comment is about, and use that line's number from its [RIGHT:N]/[LEFT:N] annotation
+- You MUST pass anchor_excerpt: the exact text of the anchor line (everything after the \`[RIGHT:N]\` / \`[LEFT:N]\` prefix). The server rejects the comment if it doesn't match — this is your safety check that you picked the right line
 - Prefer multi-line ranges (start_line + line) over single-line comments whenever the issue concerns more than one line. If you discuss a whole function, loop, conditional, or block — highlight the entire span, not just the first line. Single-line comments are only for issues genuinely confined to one line (a typo, a single bad call, one missing semicolon). start_line must be ≤ line and both must be in the same diff hunk
 - If the relevant code is completely outside any diff hunk (not visible in the diff at all), do NOT post an inline comment — skip it
 - Comment body is rendered as GitHub markdown — write human prose, not raw diff syntax. NEVER paste \`@@ ... @@\` hunk headers, \`---\`/\`+++\` file headers, or \`[RIGHT:N]\`/\`[LEFT:N]\` annotations into the body. If you need to quote code, use a normal markdown code block
@@ -375,16 +414,20 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
     case 'create_inline_comment': {
       if (!ctx.diffMap) await loadDiffMap(ctx);
       const side = (input.side ?? 'RIGHT') as 'RIGHT' | 'LEFT';
+      if (typeof input.anchor_excerpt !== 'string' || input.anchor_excerpt.trim() === '') {
+        return `REJECTED: anchor_excerpt is required. Copy the exact text of the anchor line (start_line if set, otherwise line) from the diff — without the [RIGHT:N] prefix.`;
+      }
       const validationError = validateCommentLine(
         ctx.diffMap!,
         input.path,
         side,
         input.line,
-        input.start_line
+        input.start_line,
+        input.anchor_excerpt
       );
       if (validationError) {
         console.warn(`[reviewer] rejected comment on ${input.path}:${input.line}: ${validationError}`);
-        return `REJECTED: ${validationError} The diff annotations show [RIGHT:N] for new-file lines and [LEFT:N] for old-file lines — copy N exactly from there.`;
+        return `REJECTED: ${validationError} The diff annotations show [RIGHT:N] for new-file lines and [LEFT:N] for old-file lines — copy both the number and the content exactly from there.`;
       }
 
       const res = await fetch(
