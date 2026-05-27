@@ -49,6 +49,40 @@ async function callBedrock(
   };
 }
 
+function annotateDiff(diff: string): string {
+  const lines = diff.split('\n');
+  const result: string[] = [];
+  let oldLine = 0;
+  let newLine = 0;
+
+  for (const line of lines) {
+    if (line.startsWith('@@')) {
+      const match = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
+      if (match) {
+        oldLine = parseInt(match[1], 10);
+        newLine = parseInt(match[2], 10);
+      }
+      result.push(line);
+    } else if (line.startsWith('+')) {
+      result.push(`+[RIGHT:${newLine}] ${line.slice(1)}`);
+      newLine++;
+    } else if (line.startsWith('-')) {
+      result.push(`-[LEFT:${oldLine}] ${line.slice(1)}`);
+      oldLine++;
+    } else if (line.startsWith('\\')) {
+      result.push(line);
+    } else if (line.startsWith(' ')) {
+      result.push(` [RIGHT:${newLine}] ${line.slice(1)}`);
+      oldLine++;
+      newLine++;
+    } else {
+      result.push(line);
+    }
+  }
+
+  return result.join('\n');
+}
+
 const TOOLS = [
   {
     toolSpec: {
@@ -96,13 +130,14 @@ const TOOLS = [
   {
     toolSpec: {
       name: 'create_inline_comment',
-      description: 'Post an inline review comment on a specific line of the PR diff. IMPORTANT: line must be a line number visible in the diff hunk from get_pr_diff — not from read_file. Only lines within diff hunks are valid.',
+      description: 'Post an inline review comment on a line or range of lines in the PR diff. Lines must be visible in the diff hunk (including unchanged context lines shown around changes). Use start_line+line to highlight a multi-line range.',
       inputSchema: {
         json: {
           type: 'object',
           properties: {
             path: { type: 'string', description: 'File path exactly as shown in the diff' },
-            line: { type: 'number', description: 'Line number from the diff hunk — use line numbers visible in the diff, not from read_file' },
+            line: { type: 'number', description: 'End line of the comment (or the only line for single-line). Must be visible in the diff hunk.' },
+            start_line: { type: 'number', description: 'Start line for a multi-line comment range. Must be in the same diff hunk as line. Omit for single-line comments.' },
             side: {
               type: 'string',
               enum: ['LEFT', 'RIGHT'],
@@ -138,7 +173,13 @@ Your review process:
 6. Use \`\`\`suggestion blocks when you have a concrete fix
 
 Be thorough but only report real issues. Skip style nitpicks.
-When posting inline comments, always use line numbers from get_pr_diff hunks — never from read_file.
+
+Rules for inline comments:
+- The diff from get_pr_diff annotates every line with its exact line number: `+[RIGHT:42]` means added line 42 (use side=RIGHT, line=42), `-[LEFT:41]` means removed line 41 (use side=LEFT, line=41), ` [RIGHT:42]` means context line 42 (use side=RIGHT, line=42)
+- Always read the line number directly from the annotation — never count lines yourself
+- Use start_line + line to highlight a multi-line range when the issue spans multiple lines; start_line must be ≤ line and both must be from the same diff hunk
+- If the relevant code is completely outside any diff hunk (not visible in the diff at all), do NOT post an inline comment — skip it
+
 When done reviewing, say "Review complete." and stop calling tools.`;
 
 interface ReviewContext {
@@ -215,7 +256,7 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
         pull_number: ctx.pullNumber,
         headers: { accept: 'application/vnd.github.v3.diff' },
       });
-      return String(data);
+      return annotateDiff(String(data));
     }
 
     case 'list_pr_files': {
@@ -264,6 +305,7 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
             body: input.body,
             path: input.path,
             line: input.line,
+            ...(input.start_line ? { start_line: input.start_line, start_side: input.side ?? 'RIGHT' } : {}),
             side: input.side ?? 'RIGHT',
             commit_id: ctx.headSha,
           }),
