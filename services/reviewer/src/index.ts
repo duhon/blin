@@ -414,7 +414,28 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
     case 'create_inline_comment': {
       if (!ctx.diffMap) await loadDiffMap(ctx);
       const side = (input.side ?? 'RIGHT') as 'RIGHT' | 'LEFT';
+
+      console.log(`[reviewer][comment] === incoming call ===`);
+      console.log(`[reviewer][comment] path=${input.path}`);
+      console.log(`[reviewer][comment] line=${input.line} start_line=${input.start_line ?? '(none)'} side=${side}`);
+      console.log(`[reviewer][comment] anchor_excerpt=${JSON.stringify(input.anchor_excerpt)}`);
+      console.log(`[reviewer][comment] body=${JSON.stringify(input.body?.slice(0, 200))}${input.body?.length > 200 ? '...' : ''}`);
+
+      const file = ctx.diffMap!.get(input.path);
+      if (file) {
+        const lineMap = side === 'RIGHT' ? file.rightLines : file.leftLines;
+        const anchorLine = input.start_line ?? input.line;
+        const endLine = input.line;
+        console.log(`[reviewer][comment] actual line ${anchorLine}=${JSON.stringify(lineMap.get(anchorLine))}`);
+        if (anchorLine !== endLine) {
+          console.log(`[reviewer][comment] actual line ${endLine}=${JSON.stringify(lineMap.get(endLine))}`);
+        }
+      } else {
+        console.log(`[reviewer][comment] file NOT in diff. known files: ${[...ctx.diffMap!.keys()].join(', ')}`);
+      }
+
       if (typeof input.anchor_excerpt !== 'string' || input.anchor_excerpt.trim() === '') {
+        console.warn(`[reviewer][comment] REJECTED: missing anchor_excerpt`);
         return `REJECTED: anchor_excerpt is required. Copy the exact text of the anchor line (start_line if set, otherwise line) from the diff — without the [RIGHT:N] prefix.`;
       }
       const validationError = validateCommentLine(
@@ -426,9 +447,19 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
         input.anchor_excerpt
       );
       if (validationError) {
-        console.warn(`[reviewer] rejected comment on ${input.path}:${input.line}: ${validationError}`);
+        console.warn(`[reviewer][comment] REJECTED: ${validationError}`);
         return `REJECTED: ${validationError} The diff annotations show [RIGHT:N] for new-file lines and [LEFT:N] for old-file lines — copy both the number and the content exactly from there.`;
       }
+
+      const requestBody = {
+        body: input.body,
+        path: input.path,
+        line: input.line,
+        ...(input.start_line ? { start_line: input.start_line, start_side: side } : {}),
+        side,
+        commit_id: ctx.headSha,
+      };
+      console.log(`[reviewer][comment] POST /pulls/${ctx.pullNumber}/comments body=${JSON.stringify({ ...requestBody, body: '<omitted>' })}`);
 
       const res = await fetch(
         `https://api.github.com/repos/${ctx.owner}/${ctx.repo}/pulls/${ctx.pullNumber}/comments`,
@@ -439,22 +470,17 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
             'Content-Type': 'application/json',
             'Accept': 'application/vnd.github.v3+json',
           },
-          body: JSON.stringify({
-            body: input.body,
-            path: input.path,
-            line: input.line,
-            ...(input.start_line ? { start_line: input.start_line, start_side: side } : {}),
-            side,
-            commit_id: ctx.headSha,
-          }),
+          body: JSON.stringify(requestBody),
         }
       );
       if (!res.ok) {
         const err = await res.text();
-        console.error(`[reviewer] failed to comment on ${input.path}:${input.line}: ${err}`);
+        console.error(`[reviewer][comment] github API failed (${res.status}): ${err}`);
         return `Failed to post comment on ${input.path}:${input.line} (side: ${side}): ${err}`;
       }
-      console.log(`[reviewer] commented on ${input.path}:${input.line}`);
+      const created = await res.json() as any;
+      console.log(`[reviewer][comment] SUCCESS id=${created.id} url=${created.html_url}`);
+      console.log(`[reviewer][comment] github attached to line=${created.line} start_line=${created.start_line ?? '(none)'} side=${created.side} original_line=${created.original_line}`);
       return 'Comment posted successfully';
     }
 
@@ -496,8 +522,15 @@ export function register(bus: IEventBus, githubApp: App): void {
     ];
 
     for (let i = 0; i < MAX_ITERATIONS; i++) {
+      console.log(`[reviewer] --- iteration ${i + 1}/${MAX_ITERATIONS} ---`);
       const response = await callBedrock(SYSTEM_PROMPT, messages, TOOLS);
       messages.push({ role: 'assistant', content: response.content });
+
+      for (const block of response.content) {
+        if (block.text) {
+          console.log(`[reviewer] claude text: ${block.text.slice(0, 300)}${block.text.length > 300 ? '...' : ''}`);
+        }
+      }
 
       if (response.stopReason === 'end_turn') {
         console.log(`[reviewer] done PR #${event.pr.number}`);
@@ -507,8 +540,9 @@ export function register(bus: IEventBus, githubApp: App): void {
       const toolResults: any[] = [];
       for (const block of response.content) {
         if (block.toolUse) {
-          console.log(`[reviewer] tool: ${block.toolUse.name}`);
+          console.log(`[reviewer] tool: ${block.toolUse.name} input=${JSON.stringify(block.toolUse.input).slice(0, 500)}`);
           const result = await executeTool(block.toolUse.name, block.toolUse.input, ctx);
+          console.log(`[reviewer] tool result (first 300 chars): ${result.slice(0, 300)}${result.length > 300 ? '...' : ''}`);
           toolResults.push({
             toolResult: {
               toolUseId: block.toolUse.toolUseId,
