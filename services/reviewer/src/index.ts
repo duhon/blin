@@ -96,17 +96,17 @@ const TOOLS = [
   {
     toolSpec: {
       name: 'create_inline_comment',
-      description: 'Post an inline review comment on a specific line of the PR diff',
+      description: 'Post an inline review comment on a specific line of the PR diff. IMPORTANT: line must be a line number visible in the diff hunk from get_pr_diff — not from read_file. Only lines within diff hunks are valid.',
       inputSchema: {
         json: {
           type: 'object',
           properties: {
-            path: { type: 'string', description: 'File path' },
-            line: { type: 'number', description: 'Line number' },
+            path: { type: 'string', description: 'File path exactly as shown in the diff' },
+            line: { type: 'number', description: 'Line number from the diff hunk — use line numbers visible in the diff, not from read_file' },
             side: {
               type: 'string',
               enum: ['LEFT', 'RIGHT'],
-              description: 'RIGHT for added lines (new file), LEFT for deleted lines (old file). Default: RIGHT',
+              description: 'RIGHT for added/context lines in new file, LEFT for removed lines in old file. Default: RIGHT',
             },
             body: {
               type: 'string',
@@ -138,6 +138,7 @@ Your review process:
 6. Use \`\`\`suggestion blocks when you have a concrete fix
 
 Be thorough but only report real issues. Skip style nitpicks.
+When posting inline comments, always use line numbers from get_pr_diff hunks — never from read_file.
 When done reviewing, say "Review complete." and stop calling tools.`;
 
 interface ReviewContext {
@@ -270,7 +271,8 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
       );
       if (!res.ok) {
         const err = await res.text();
-        return `Failed to post comment: ${res.status} ${err}`;
+        console.error(`[reviewer] failed to comment on ${input.path}:${input.line}: ${err}`);
+        return `Failed to post comment on ${input.path}:${input.line} (side: ${input.side ?? 'RIGHT'}): ${err}. Make sure the line number is within a diff hunk from get_pr_diff.`;
       }
       console.log(`[reviewer] commented on ${input.path}:${input.line}`);
       return 'Comment posted successfully';
