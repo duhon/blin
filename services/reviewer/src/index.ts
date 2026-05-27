@@ -6,6 +6,11 @@ const BEDROCK_MODEL = 'us.anthropic.claude-sonnet-4-6';
 const MAX_ITERATIONS = 20;
 const MAX_FILE_CHARS = 10000;
 
+const DEFAULT_CONFIG = {
+  knowledge: [] as string[],
+  context_files: [] as string[],
+};
+
 interface BedrockResponse {
   content: any[];
   stopReason: string;
@@ -160,34 +165,37 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
       };
 
       const blinYml = await readFile('.github/blin.yml');
-      if (!blinYml) return 'No .github/blin.yml found. Apply general best practices.';
 
-      const sections: string[] = [];
+      let knowledge = DEFAULT_CONFIG.knowledge;
+      let contextFiles = DEFAULT_CONFIG.context_files;
 
-      // Load global knowledge packs
-      const knowledgeMatch = blinYml.match(/knowledge:\s*((?:\s+-\s+.+\n?)+)/);
-      if (knowledgeMatch) {
-        const names = [...knowledgeMatch[1].matchAll(/-\s+(\S+)/g)].map(m => m[1].trim());
-        for (const name of names) {
-          if (knowledgePacks[name]) {
-            sections.push(`## Global knowledge: ${name}\n${knowledgePacks[name]}`);
-          }
+      if (blinYml) {
+        const knowledgeMatch = blinYml.match(/knowledge:\s*((?:\s+-\s+.+\n?)+)/);
+        if (knowledgeMatch) {
+          knowledge = [...knowledgeMatch[1].matchAll(/-\s+(\S+)/g)].map(m => m[1].trim());
+        }
+        const contextFilesMatch = blinYml.match(/context_files:\s*((?:\s+-\s+.+\n?)+)/);
+        if (contextFilesMatch) {
+          contextFiles = [...contextFilesMatch[1].matchAll(/-\s+(.+)/g)].map(m => m[1].trim());
         }
       }
 
-      // Load project-specific context files
-      const contextFilesMatch = blinYml.match(/context_files:\s*((?:\s+-\s+.+\n?)+)/);
-      if (contextFilesMatch) {
-        const paths = [...contextFilesMatch[1].matchAll(/-\s+(.+)/g)].map(m => m[1].trim());
-        for (const path of paths) {
-          const content = await readFile(path);
-          if (content) sections.push(`## ${path}\n${content}`);
+      const sections: string[] = [];
+
+      for (const name of knowledge) {
+        if (knowledgePacks[name]) {
+          sections.push(`## Global knowledge: ${name}\n${knowledgePacks[name]}`);
         }
+      }
+
+      for (const path of contextFiles) {
+        const content = await readFile(path);
+        if (content) sections.push(`## ${path}\n${content}`);
       }
 
       return sections.length > 0
         ? sections.join('\n\n')
-        : 'No conventions or knowledge configured. Apply general best practices.';
+        : 'No project conventions configured. Apply general best practices.';
     }
 
     case 'get_pr_description': {
