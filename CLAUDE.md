@@ -61,4 +61,8 @@ PORT=3000
 ## GitHub App
 - Name: blin-bot
 - Webhook URL: set to Codespace forwarded port URL (port 3000, make it public)
-- Events: pull_request, pull_request_review_comment, check_run
+- Events: pull_request, pull_request_review_comment, check_run, issue_comment
+
+## Working rules
+- Before implementing any feature, check README.md — it is the source of requirements
+- If a request contradicts or extends README.md, flag the discrepancy before writing code
