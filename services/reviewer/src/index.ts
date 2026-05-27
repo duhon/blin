@@ -2,8 +2,19 @@ import type { IEventBus, ReviewRequestedEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
 
 const BEDROCK_MODEL = 'us.anthropic.claude-sonnet-4-6';
+const MAX_ITERATIONS = 20;
+const MAX_FILE_CHARS = 10000;
 
-async function callBedrock(systemPrompt: string, userPrompt: string): Promise<string> {
+interface BedrockResponse {
+  content: any[];
+  stopReason: string;
+}
+
+async function callBedrock(
+  systemPrompt: string,
+  messages: any[],
+  tools: any[]
+): Promise<BedrockResponse> {
   const region = process.env.AWS_REGION ?? 'us-east-1';
   const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
   const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL)}/converse`;
@@ -16,7 +27,8 @@ async function callBedrock(systemPrompt: string, userPrompt: string): Promise<st
     },
     body: JSON.stringify({
       system: [{ text: systemPrompt }],
-      messages: [{ role: 'user', content: [{ text: userPrompt }] }],
+      messages,
+      toolConfig: { tools },
     }),
   });
 
@@ -25,72 +37,226 @@ async function callBedrock(systemPrompt: string, userPrompt: string): Promise<st
   }
 
   const data = await response.json() as any;
-  return data?.output?.message?.content?.[0]?.text ?? '';
-}
-
-interface InlineComment {
-  file: string;
-  line: number;
-  message: string;
-  suggestion: string | null;
-}
-
-// Parses unified diff and returns annotated added lines per file:
-// "+42: some code" — Claude uses these line numbers directly in JSON response
-function buildAnnotatedDiff(diff: string): string {
-  const sections: string[] = [];
-  let currentFile = '';
-  let newLineNo = 0;
-  let addedLines: string[] = [];
-
-  const flush = () => {
-    if (currentFile && addedLines.length > 0) {
-      sections.push(`### ${currentFile}\n${addedLines.join('\n')}`);
-    }
-    addedLines = [];
+  return {
+    content: data.output.message.content,
+    stopReason: data.stopReason,
   };
-
-  for (const line of diff.split('\n')) {
-    if (line.startsWith('+++ b/')) {
-      flush();
-      currentFile = line.slice(6);
-      newLineNo = 0;
-    } else if (line.startsWith('@@ ')) {
-      const match = line.match(/\+(\d+)/);
-      newLineNo = match ? parseInt(match[1], 10) : 0;
-    } else if (line.startsWith('+') && !line.startsWith('+++')) {
-      addedLines.push(`+${newLineNo}: ${line.slice(1)}`);
-      newLineNo++;
-    } else if (!line.startsWith('-') && !line.startsWith('\\')
-      && !line.startsWith('diff') && !line.startsWith('index') && !line.startsWith('---')) {
-      newLineNo++;
-    }
-  }
-  flush();
-
-  return sections.join('\n\n');
 }
 
-const SYSTEM_PROMPT = `You are a senior engineer reviewing a pull request.
-Return ONLY a valid JSON array of inline review comments.
-
-Format:
-[
+const TOOLS = [
   {
-    "file": "<relative_file_path>",
-    "line": <line_number>,
-    "message": "<short review message>",
-    "suggestion": "<replacement code or null>"
-  }
-]
+    toolSpec: {
+      name: 'get_project_conventions',
+      description: 'Get the project conventions, coding standards, and architecture rules defined for this repository. Always call this first before reviewing.',
+      inputSchema: { json: { type: 'object', properties: {} } },
+    },
+  },
+  {
+    toolSpec: {
+      name: 'get_pr_description',
+      description: 'Get the PR title, description, and base/head branch info',
+      inputSchema: { json: { type: 'object', properties: {} } },
+    },
+  },
+  {
+    toolSpec: {
+      name: 'get_pr_diff',
+      description: 'Get the full diff of the pull request',
+      inputSchema: { json: { type: 'object', properties: {} } },
+    },
+  },
+  {
+    toolSpec: {
+      name: 'list_pr_files',
+      description: 'List all files changed in this PR with their status (added/modified/deleted)',
+      inputSchema: { json: { type: 'object', properties: {} } },
+    },
+  },
+  {
+    toolSpec: {
+      name: 'read_file',
+      description: 'Read the current content of a file in the repository at the PR head commit',
+      inputSchema: {
+        json: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path relative to repo root' },
+          },
+          required: ['path'],
+        },
+      },
+    },
+  },
+  {
+    toolSpec: {
+      name: 'create_inline_comment',
+      description: 'Post an inline review comment on a specific line of the PR diff',
+      inputSchema: {
+        json: {
+          type: 'object',
+          properties: {
+            path: { type: 'string', description: 'File path' },
+            line: { type: 'number', description: 'Line number' },
+            side: {
+              type: 'string',
+              enum: ['LEFT', 'RIGHT'],
+              description: 'RIGHT for added lines (new file), LEFT for deleted lines (old file). Default: RIGHT',
+            },
+            body: {
+              type: 'string',
+              description: 'Comment text. For code suggestions use: ```suggestion\\nreplacement code\\n```',
+            },
+          },
+          required: ['path', 'line', 'body'],
+        },
+      },
+    },
+  },
+];
 
-Rules:
-- "file" must exactly match the file path shown in the diff
-- "line" must be the integer shown before the colon (e.g. "+42: code" → 42)
-- "message" must be short and actionable (1-2 sentences)
-- "suggestion" is the replacement code without markdown fences, or null
-- Return [] if no issues found
-- Do not include anything outside the JSON array`;
+const SYSTEM_PROMPT = `You are a senior engineer doing a thorough code review of a pull request.
+
+You have tools to explore the PR and post inline comments:
+- get_pr_description: understand the purpose of the PR
+- get_pr_diff: see what changed
+- list_pr_files: see all changed files
+- read_file: read any file in the repo for full context
+- create_inline_comment: post a comment on a specific line
+
+Your review process:
+1. get_project_conventions — always start here to understand the project rules
+2. get_pr_description — understand the purpose of the PR
+3. get_pr_diff — see what changed
+4. read_file as needed — get context from related files, types, interfaces
+5. create_inline_comment — post comments for real issues found
+6. Use \`\`\`suggestion blocks when you have a concrete fix
+
+Be thorough but only report real issues. Skip style nitpicks.
+When done reviewing, say "Review complete." and stop calling tools.`;
+
+interface ReviewContext {
+  octokit: any;
+  owner: string;
+  repo: string;
+  pullNumber: number;
+  headSha: string;
+  pat: string | undefined;
+  pr: { title: string; body: string | null; base: string; head: string };
+}
+
+async function executeTool(name: string, input: any, ctx: ReviewContext): Promise<string> {
+  switch (name) {
+    case 'get_project_conventions': {
+      const readFile = async (path: string): Promise<string | null> => {
+        try {
+          const { data } = await ctx.octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+            owner: ctx.owner, repo: ctx.repo, path, ref: ctx.headSha,
+          });
+          return Buffer.from(data.content, 'base64').toString('utf8');
+        } catch {
+          return null;
+        }
+      };
+
+      const blinYml = await readFile('.github/blin.yml');
+      if (!blinYml) return 'No .github/blin.yml found. Apply general best practices.';
+
+      const sections: string[] = [`## .github/blin.yml\n${blinYml}`];
+
+      const contextFilesMatch = blinYml.match(/context_files:\s*((?:\s+-\s+.+\n?)+)/);
+      if (contextFilesMatch) {
+        const paths = [...contextFilesMatch[1].matchAll(/-\s+(.+)/g)].map(m => m[1].trim());
+        for (const path of paths) {
+          const content = await readFile(path);
+          if (content) sections.push(`## ${path}\n${content}`);
+        }
+      }
+
+      return sections.join('\n\n');
+    }
+
+    case 'get_pr_description': {
+      return JSON.stringify({
+        title: ctx.pr.title,
+        body: ctx.pr.body ?? '(no description)',
+        base: ctx.pr.base,
+        head: ctx.pr.head,
+      });
+    }
+
+    case 'get_pr_diff': {
+      const { data } = await ctx.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+        owner: ctx.owner,
+        repo: ctx.repo,
+        pull_number: ctx.pullNumber,
+        headers: { accept: 'application/vnd.github.v3.diff' },
+      });
+      return String(data);
+    }
+
+    case 'list_pr_files': {
+      const { data } = await ctx.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/files', {
+        owner: ctx.owner,
+        repo: ctx.repo,
+        pull_number: ctx.pullNumber,
+        per_page: 100,
+      });
+      return JSON.stringify(data.map((f: any) => ({
+        path: f.filename,
+        status: f.status,
+        additions: f.additions,
+        deletions: f.deletions,
+      })));
+    }
+
+    case 'read_file': {
+      try {
+        const { data } = await ctx.octokit.request('GET /repos/{owner}/{repo}/contents/{path}', {
+          owner: ctx.owner,
+          repo: ctx.repo,
+          path: input.path,
+          ref: ctx.headSha,
+        });
+        const content = Buffer.from(data.content, 'base64').toString('utf8');
+        return content.length > MAX_FILE_CHARS
+          ? content.slice(0, MAX_FILE_CHARS) + '\n... (truncated)'
+          : content;
+      } catch (err: any) {
+        return `Error reading file: ${err.message}`;
+      }
+    }
+
+    case 'create_inline_comment': {
+      const res = await fetch(
+        `https://api.github.com/repos/${ctx.owner}/${ctx.repo}/pulls/${ctx.pullNumber}/comments`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${ctx.pat}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/vnd.github.v3+json',
+          },
+          body: JSON.stringify({
+            body: input.body,
+            path: input.path,
+            line: input.line,
+            side: input.side ?? 'RIGHT',
+            commit_id: ctx.headSha,
+          }),
+        }
+      );
+      if (!res.ok) {
+        const err = await res.text();
+        return `Failed to post comment: ${res.status} ${err}`;
+      }
+      console.log(`[reviewer] commented on ${input.path}:${input.line}`);
+      return 'Comment posted successfully';
+    }
+
+    default:
+      return `Unknown tool: ${name}`;
+  }
+}
 
 export function register(bus: IEventBus, githubApp: App): void {
   bus.subscribe<ReviewRequestedEvent>('review.requested', async (event) => {
@@ -103,82 +269,51 @@ export function register(bus: IEventBus, githubApp: App): void {
       repo: event.repo.name,
       pull_number: event.pr.number,
     });
-    const headSha = prData.head.sha;
 
-    const { data: diffData } = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+    const ctx: ReviewContext = {
+      octokit,
       owner: event.repo.owner,
       repo: event.repo.name,
-      pull_number: event.pr.number,
-      headers: { accept: 'application/vnd.github.v3.diff' },
-    });
+      pullNumber: event.pr.number,
+      headSha: prData.head.sha,
+      pat: process.env.GITHUB_REVIEWER_PAT,
+      pr: {
+        title: event.pr.title,
+        body: event.pr.body,
+        base: prData.base.ref,
+        head: prData.head.ref,
+      },
+    };
 
-    const annotatedDiff = buildAnnotatedDiff(String(diffData).slice(0, 16000));
+    const messages: any[] = [
+      { role: 'user', content: [{ text: `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}` }] },
+    ];
 
-    if (!annotatedDiff) {
-      console.log(`[reviewer] no added lines to review in PR #${event.pr.number}`);
-      return;
-    }
+    for (let i = 0; i < MAX_ITERATIONS; i++) {
+      const response = await callBedrock(SYSTEM_PROMPT, messages, TOOLS);
+      messages.push({ role: 'assistant', content: response.content });
 
-    const userPrompt = `PR title: "${event.pr.title}"
-
-Review the changed lines below. Focus on: bugs, security issues, correctness, code quality.
-
-## Changed lines
-
-${annotatedDiff}`;
-
-    const raw = await callBedrock(SYSTEM_PROMPT, userPrompt);
-
-    let comments: InlineComment[];
-    try {
-      const match = raw.match(/\[[\s\S]*\]/);
-      comments = match ? JSON.parse(match[0]) : [];
-    } catch {
-      console.error('[reviewer] failed to parse Claude response as JSON:', raw);
-      return;
-    }
-
-    if (comments.length === 0) {
-      console.log(`[reviewer] no issues found in PR #${event.pr.number}`);
-      return;
-    }
-
-    console.log(`[reviewer] posting ${comments.length} inline comments on PR #${event.pr.number}`);
-
-    const pat = process.env.GITHUB_REVIEWER_PAT;
-    let posted = 0;
-
-    for (const comment of comments) {
-      const body = comment.suggestion
-        ? `${comment.message}\n\n\`\`\`suggestion\n${comment.suggestion}\n\`\`\``
-        : comment.message;
-
-      const res = await fetch(
-        `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/comments`,
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${pat}`,
-            'Content-Type': 'application/json',
-            'Accept': 'application/vnd.github.v3+json',
-          },
-          body: JSON.stringify({
-            body,
-            path: comment.file,
-            line: comment.line,
-            commit_id: headSha,
-          }),
-        }
-      );
-
-      if (res.ok) {
-        posted++;
-      } else {
-        const err = await res.text();
-        console.error(`[reviewer] failed to post comment on ${comment.file}:${comment.line}: ${err}`);
+      if (response.stopReason === 'end_turn') {
+        console.log(`[reviewer] done PR #${event.pr.number}`);
+        break;
       }
-    }
 
-    console.log(`[reviewer] done PR #${event.pr.number}: ${posted}/${comments.length} comments posted`);
+      const toolResults: any[] = [];
+      for (const block of response.content) {
+        if (block.toolUse) {
+          console.log(`[reviewer] tool: ${block.toolUse.name}`);
+          const result = await executeTool(block.toolUse.name, block.toolUse.input, ctx);
+          toolResults.push({
+            toolResult: {
+              toolUseId: block.toolUse.toolUseId,
+              content: [{ text: result }],
+            },
+          });
+        }
+      }
+
+      if (toolResults.length === 0) break;
+      messages.push({ role: 'user', content: toolResults });
+    }
   });
 }
