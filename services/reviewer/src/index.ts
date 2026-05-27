@@ -1,5 +1,6 @@
 import type { IEventBus, ReviewRequestedEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
+import { knowledgePacks } from './knowledge/index.js';
 
 const BEDROCK_MODEL = 'us.anthropic.claude-sonnet-4-6';
 const MAX_ITERATIONS = 20;
@@ -161,8 +162,20 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
       const blinYml = await readFile('.github/blin.yml');
       if (!blinYml) return 'No .github/blin.yml found. Apply general best practices.';
 
-      const sections: string[] = [`## .github/blin.yml\n${blinYml}`];
+      const sections: string[] = [];
 
+      // Load global knowledge packs
+      const knowledgeMatch = blinYml.match(/knowledge:\s*((?:\s+-\s+.+\n?)+)/);
+      if (knowledgeMatch) {
+        const names = [...knowledgeMatch[1].matchAll(/-\s+(\S+)/g)].map(m => m[1].trim());
+        for (const name of names) {
+          if (knowledgePacks[name]) {
+            sections.push(`## Global knowledge: ${name}\n${knowledgePacks[name]}`);
+          }
+        }
+      }
+
+      // Load project-specific context files
       const contextFilesMatch = blinYml.match(/context_files:\s*((?:\s+-\s+.+\n?)+)/);
       if (contextFilesMatch) {
         const paths = [...contextFilesMatch[1].matchAll(/-\s+(.+)/g)].map(m => m[1].trim());
@@ -172,7 +185,9 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
         }
       }
 
-      return sections.join('\n\n');
+      return sections.length > 0
+        ? sections.join('\n\n')
+        : 'No conventions or knowledge configured. Apply general best practices.';
     }
 
     case 'get_pr_description': {
