@@ -6,6 +6,18 @@ GitHub App for automated developer workflow.
 
 A GitHub App that automates routine developer tasks — code review, testing, releases, and preview environments. Each capability is handled by a dedicated service that can be configured per repository.
 
+## Architecture
+
+```
+GitHub Webhook → AWS Lambda → InMemoryEventBus → Services → GitHub API
+```
+
+- **Gateway** — receives webhooks, routes events to services via event bus
+- **Reviewer** — agentic loop: reads project conventions, explores PR context, posts inline comments
+- **Event Bus** — in-memory, interface allows swapping to Redis/RabbitMQ later
+- **AI** — AWS Bedrock (Claude Sonnet)
+- **Knowledge packs** — global best practices (e.g. Magento 2) bundled into the service, enabled per repo via `blin.yml`
+
 ## Configuration
 
 Each repository can configure blin via `.github/blin.yml`:
