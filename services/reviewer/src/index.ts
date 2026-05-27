@@ -49,38 +49,110 @@ async function callBedrock(
   };
 }
 
-function annotateDiff(diff: string): string {
+type HunkRange = { start: number; end: number };
+type FileHunks = { rightHunks: HunkRange[]; leftHunks: HunkRange[] };
+type DiffMap = Map<string, FileHunks>;
+
+function processDiff(diff: string): { annotated: string; map: DiffMap } {
   const lines = diff.split('\n');
   const result: string[] = [];
+  const map: DiffMap = new Map();
+
+  let currentFile: string | null = null;
+  let currentFileHunks: FileHunks | null = null;
+  let rightHunk: HunkRange | null = null;
+  let leftHunk: HunkRange | null = null;
   let oldLine = 0;
   let newLine = 0;
 
+  const closeHunks = () => {
+    if (currentFileHunks) {
+      if (rightHunk) currentFileHunks.rightHunks.push(rightHunk);
+      if (leftHunk) currentFileHunks.leftHunks.push(leftHunk);
+    }
+    rightHunk = null;
+    leftHunk = null;
+  };
+
   for (const line of lines) {
-    if (line.startsWith('@@')) {
+    if (line.startsWith('diff --git')) {
+      closeHunks();
+      const m = line.match(/^diff --git a\/(.+?) b\/(.+)$/);
+      currentFile = m ? m[2] : null;
+      if (currentFile) {
+        currentFileHunks = { rightHunks: [], leftHunks: [] };
+        map.set(currentFile, currentFileHunks);
+      } else {
+        currentFileHunks = null;
+      }
+      result.push(line);
+    } else if (line.startsWith('@@')) {
+      closeHunks();
       const match = line.match(/@@ -(\d+)(?:,\d+)? \+(\d+)(?:,\d+)? @@/);
       if (match) {
         oldLine = parseInt(match[1], 10);
         newLine = parseInt(match[2], 10);
       }
       result.push(line);
+    } else if (line.startsWith('+++') || line.startsWith('---')) {
+      result.push(line);
     } else if (line.startsWith('+')) {
       result.push(`+[RIGHT:${newLine}] ${line.slice(1)}`);
+      if (!rightHunk) rightHunk = { start: newLine, end: newLine };
+      else rightHunk.end = newLine;
       newLine++;
     } else if (line.startsWith('-')) {
       result.push(`-[LEFT:${oldLine}] ${line.slice(1)}`);
+      if (!leftHunk) leftHunk = { start: oldLine, end: oldLine };
+      else leftHunk.end = oldLine;
       oldLine++;
     } else if (line.startsWith('\\')) {
       result.push(line);
     } else if (line.startsWith(' ')) {
       result.push(` [RIGHT:${newLine}] ${line.slice(1)}`);
+      if (!rightHunk) rightHunk = { start: newLine, end: newLine };
+      else rightHunk.end = newLine;
+      if (!leftHunk) leftHunk = { start: oldLine, end: oldLine };
+      else leftHunk.end = oldLine;
       oldLine++;
       newLine++;
     } else {
       result.push(line);
     }
   }
+  closeHunks();
 
-  return result.join('\n');
+  return { annotated: result.join('\n'), map };
+}
+
+function validateCommentLine(
+  map: DiffMap,
+  path: string,
+  side: 'RIGHT' | 'LEFT',
+  line: number,
+  startLine?: number
+): string | null {
+  const file = map.get(path);
+  if (!file) {
+    const known = [...map.keys()].join(', ') || '(none)';
+    return `File "${path}" is not in the diff. Files in diff: ${known}`;
+  }
+  const hunks = side === 'RIGHT' ? file.rightHunks : file.leftHunks;
+  if (hunks.length === 0) {
+    return `No ${side} hunks for "${path}". Try side=${side === 'RIGHT' ? 'LEFT' : 'RIGHT'}.`;
+  }
+  const ranges = hunks.map(h => `${h.start}-${h.end}`).join(', ');
+  const target = hunks.find(h => line >= h.start && line <= h.end);
+  if (!target) {
+    return `Line ${line} on side ${side} is not in any diff hunk for "${path}". Valid ${side} ranges: ${ranges}. Pick a line from one of those ranges.`;
+  }
+  if (startLine !== undefined) {
+    if (startLine > line) return `start_line (${startLine}) must be <= line (${line})`;
+    if (startLine < target.start || startLine > target.end) {
+      return `start_line ${startLine} must be in the same hunk as line ${line} (hunk: ${target.start}-${target.end})`;
+    }
+  }
+  return null;
 }
 
 const TOOLS = [
@@ -175,7 +247,7 @@ Your review process:
 Be thorough but only report real issues. Skip style nitpicks.
 
 Rules for inline comments:
-- The diff from get_pr_diff annotates every line with its exact line number: `+[RIGHT:42]` means added line 42 (use side=RIGHT, line=42), `-[LEFT:41]` means removed line 41 (use side=LEFT, line=41), ` [RIGHT:42]` means context line 42 (use side=RIGHT, line=42)
+- The diff from get_pr_diff annotates every line with its exact line number: \`+[RIGHT:42]\` means added line 42 (use side=RIGHT, line=42), \`-[LEFT:41]\` means removed line 41 (use side=LEFT, line=41), \` [RIGHT:42]\` means context line 42 (use side=RIGHT, line=42)
 - Always read the line number directly from the annotation — never count lines yourself
 - Use start_line + line to highlight a multi-line range when the issue spans multiple lines; start_line must be ≤ line and both must be from the same diff hunk
 - If the relevant code is completely outside any diff hunk (not visible in the diff at all), do NOT post an inline comment — skip it
@@ -190,6 +262,19 @@ interface ReviewContext {
   headSha: string;
   pat: string | undefined;
   pr: { title: string; body: string | null; base: string; head: string };
+  diffMap: DiffMap | null;
+}
+
+async function loadDiffMap(ctx: ReviewContext): Promise<{ annotated: string; map: DiffMap }> {
+  const { data } = await ctx.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+    owner: ctx.owner,
+    repo: ctx.repo,
+    pull_number: ctx.pullNumber,
+    headers: { accept: 'application/vnd.github.v3.diff' },
+  });
+  const processed = processDiff(String(data));
+  ctx.diffMap = processed.map;
+  return processed;
 }
 
 async function executeTool(name: string, input: any, ctx: ReviewContext): Promise<string> {
@@ -250,13 +335,8 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
     }
 
     case 'get_pr_diff': {
-      const { data } = await ctx.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
-        owner: ctx.owner,
-        repo: ctx.repo,
-        pull_number: ctx.pullNumber,
-        headers: { accept: 'application/vnd.github.v3.diff' },
-      });
-      return annotateDiff(String(data));
+      const { annotated } = await loadDiffMap(ctx);
+      return annotated;
     }
 
     case 'list_pr_files': {
@@ -292,6 +372,20 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
     }
 
     case 'create_inline_comment': {
+      if (!ctx.diffMap) await loadDiffMap(ctx);
+      const side = (input.side ?? 'RIGHT') as 'RIGHT' | 'LEFT';
+      const validationError = validateCommentLine(
+        ctx.diffMap!,
+        input.path,
+        side,
+        input.line,
+        input.start_line
+      );
+      if (validationError) {
+        console.warn(`[reviewer] rejected comment on ${input.path}:${input.line}: ${validationError}`);
+        return `REJECTED: ${validationError} The diff annotations show [RIGHT:N] for new-file lines and [LEFT:N] for old-file lines — copy N exactly from there.`;
+      }
+
       const res = await fetch(
         `https://api.github.com/repos/${ctx.owner}/${ctx.repo}/pulls/${ctx.pullNumber}/comments`,
         {
@@ -305,8 +399,8 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
             body: input.body,
             path: input.path,
             line: input.line,
-            ...(input.start_line ? { start_line: input.start_line, start_side: input.side ?? 'RIGHT' } : {}),
-            side: input.side ?? 'RIGHT',
+            ...(input.start_line ? { start_line: input.start_line, start_side: side } : {}),
+            side,
             commit_id: ctx.headSha,
           }),
         }
@@ -314,7 +408,7 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
       if (!res.ok) {
         const err = await res.text();
         console.error(`[reviewer] failed to comment on ${input.path}:${input.line}: ${err}`);
-        return `Failed to post comment on ${input.path}:${input.line} (side: ${input.side ?? 'RIGHT'}): ${err}. Make sure the line number is within a diff hunk from get_pr_diff.`;
+        return `Failed to post comment on ${input.path}:${input.line} (side: ${side}): ${err}`;
       }
       console.log(`[reviewer] commented on ${input.path}:${input.line}`);
       return 'Comment posted successfully';
@@ -350,6 +444,7 @@ export function register(bus: IEventBus, githubApp: App): void {
         base: prData.base.ref,
         head: prData.head.ref,
       },
+      diffMap: null,
     };
 
     const messages: any[] = [
