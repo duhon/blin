@@ -4,7 +4,8 @@ import { knowledgePacks } from './knowledge/index.js';
 
 const BEDROCK_MODEL = 'us.anthropic.claude-sonnet-4-6';
 const MAX_ITERATIONS = 20;
-const MAX_FILE_CHARS = 10000;
+const DEFAULT_READ_LIMIT = 200;
+const MAX_READ_LIMIT = 1000;
 
 const DEFAULT_CONFIG = {
   knowledge: [] as string[],
@@ -220,12 +221,14 @@ const TOOLS = [
   {
     toolSpec: {
       name: 'read_file',
-      description: 'Read the current content of a file in the repository at the PR head commit',
+      description: `Read a slice of a file in the repository at the PR head commit. Returns lines with explicit line numbers (matching diff RIGHT line numbers) plus a footer telling you the total line count and what is missing. Paginate with offset+limit instead of re-reading the same file.`,
       inputSchema: {
         json: {
           type: 'object',
           properties: {
             path: { type: 'string', description: 'File path relative to repo root' },
+            offset: { type: 'number', description: `1-based line to start from. Default 1.` },
+            limit: { type: 'number', description: `Max lines to return. Default ${DEFAULT_READ_LIMIT}, max ${MAX_READ_LIMIT}.` },
           },
           required: ['path'],
         },
@@ -270,7 +273,7 @@ You have tools to explore the PR and post inline comments:
 - get_pr_description: understand the purpose of the PR
 - get_pr_diff: see what changed
 - list_pr_files: see all changed files
-- read_file: read any file in the repo for full context
+- read_file: read a slice of any file in the repo for full context. Paginate with offset+limit when the footer says more lines exist — do NOT re-read the same file/range expecting different output
 - create_inline_comment: post a comment on a specific line
 
 Your review process:
@@ -403,9 +406,29 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
           ref: ctx.headSha,
         });
         const content = Buffer.from(data.content, 'base64').toString('utf8');
-        return content.length > MAX_FILE_CHARS
-          ? content.slice(0, MAX_FILE_CHARS) + '\n... (truncated)'
-          : content;
+        const allLines = content.split('\n');
+        const totalLines = allLines.length;
+
+        const offset = Math.max(1, Math.floor(input.offset ?? 1));
+        const limit = Math.min(MAX_READ_LIMIT, Math.max(1, Math.floor(input.limit ?? DEFAULT_READ_LIMIT)));
+
+        if (offset > totalLines) {
+          return `File ${input.path} has ${totalLines} lines. offset=${offset} is past the end.`;
+        }
+
+        const endLine = Math.min(totalLines, offset + limit - 1);
+        const slice = allLines.slice(offset - 1, endLine);
+        const numbered = slice.map((l, i) => `${offset + i}\t${l}`).join('\n');
+
+        const footer: string[] = [`--- showing lines ${offset}-${endLine} of ${totalLines} ---`];
+        if (endLine < totalLines) {
+          footer.push(`To read more, call read_file again with offset=${endLine + 1}.`);
+        }
+        if (offset > 1) {
+          footer.push(`Earlier lines (1-${offset - 1}) are not shown.`);
+        }
+
+        return `${numbered}\n${footer.join(' ')}`;
       } catch (err: any) {
         return `Error reading file: ${err.message}`;
       }
