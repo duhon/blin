@@ -649,24 +649,27 @@ export function register(bus: IEventBus, githubApp: App): void {
       { role: 'user', content: [{ text: userRequest }] },
     ], ctx);
 
-    if (ctx.commentsPosted === 0) {
-      const res = await fetch(
-        `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/reviews`,
-        {
-          method: 'POST',
-          headers: {
-            'Authorization': `Bearer ${ctx.pat}`,
-            'Content-Type': 'application/json',
-            'Accept': 'application/vnd.github.v3+json',
-          },
-          body: JSON.stringify({ body: `Looks good to me 👍`, event: 'APPROVE' }),
-        }
-      );
-      if (res.ok) {
-        console.log(`[reviewer] PR #${event.pr.number} approved`);
-      } else {
-        console.error(`[reviewer] failed to approve PR: ${res.status} ${await res.text()}`);
+    const reviewEvent = ctx.commentsPosted === 0 ? 'APPROVE' : 'REQUEST_CHANGES';
+    const reviewBody = ctx.commentsPosted === 0
+      ? `Looks good to me 👍`
+      : `Found ${ctx.commentsPosted} critical issue${ctx.commentsPosted > 1 ? 's' : ''}. Please address the inline comments.`;
+
+    const reviewRes = await fetch(
+      `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/reviews`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${ctx.pat}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/vnd.github.v3+json',
+        },
+        body: JSON.stringify({ body: reviewBody, event: reviewEvent }),
       }
+    );
+    if (reviewRes.ok) {
+      console.log(`[reviewer] PR #${event.pr.number} review submitted: ${reviewEvent}`);
+    } else {
+      console.error(`[reviewer] failed to submit review: ${reviewRes.status} ${await reviewRes.text()}`);
     }
   });
 
