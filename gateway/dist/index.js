@@ -4005,6 +4005,9 @@ function registerWebhookHandlers(webhooks3, bus) {
   });
 }
 
+// ../services/reviewer/dist/index.js
+var import_client_s3 = require("@aws-sdk/client-s3");
+
 // ../services/reviewer/dist/knowledge/basic.js
 var basic_default = `
 # Basic Code Review Knowledge
@@ -4195,6 +4198,8 @@ var knowledgePacks = {
 };
 
 // ../services/reviewer/dist/index.js
+var s3 = new import_client_s3.S3Client({});
+var MEMORY_BUCKET = process.env.BLIN_MEMORY_BUCKET;
 var BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-6";
 var MAX_ITERATIONS = 20;
 var DEFAULT_READ_LIMIT = 200;
@@ -4364,8 +4369,26 @@ var TOOLS = [
   {
     toolSpec: {
       name: "get_project_conventions",
-      description: "Get the project conventions, coding standards, and architecture rules defined for this repository. Always call this first before reviewing.",
+      description: "Get the project conventions, coding standards, architecture rules, and accumulated memory from previous reviews of this repository. Always call this first before reviewing.",
       inputSchema: { json: { type: "object", properties: {} } }
+    }
+  },
+  {
+    toolSpec: {
+      name: "save_repo_memory",
+      description: "Persist accumulated knowledge about this repository to S3 for future reviews. Call this at the end of every review. Merge new facts with existing memory \u2014 do not discard what was already there.",
+      inputSchema: {
+        json: {
+          type: "object",
+          properties: {
+            content: {
+              type: "string",
+              description: "Full markdown content of the memory. Include: runtime versions, framework/stack, key architectural patterns, repo-specific conventions, and categories of findings that turned out to be false positives in this repo."
+            }
+          },
+          required: ["content"]
+        }
+      }
     }
   },
   {
@@ -4445,14 +4468,16 @@ You have tools to explore the PR and post inline comments:
 - list_pr_files: see all changed files
 - read_file: read a slice of any file in the repo for full context. Paginate with offset+limit when the footer says more lines exist \u2014 do NOT re-read the same file/range expecting different output
 - create_inline_comment: post a comment on a specific line
+- save_repo_memory: persist knowledge about this repo to S3 for future reviews
 
 Your review process:
-1. get_project_conventions \u2014 always start here to understand the project rules
+1. get_project_conventions \u2014 always start here; includes memory from previous reviews of this repo
 2. get_pr_description \u2014 understand the purpose of the PR
 3. get_pr_diff \u2014 see what changed
 4. read_file as needed \u2014 get context from related files, types, interfaces
 5. create_inline_comment \u2014 post comments for real issues found
 6. Use \`\`\`suggestion blocks when you have a concrete fix
+7. save_repo_memory \u2014 always call last; update memory with anything new learned about this repo
 
 Severity filter \u2014 STRICT RULE:
 - Post ONLY comments labelled [critical] (blocks merge, will cause crash/outage/data loss/security breach)
@@ -4556,6 +4581,19 @@ Do NOT flag issues that only affect versions outside these constraints.`);
         if (content)
           sections.push(`## ${path}
 ${content}`);
+      }
+      if (MEMORY_BUCKET) {
+        try {
+          const s3res = await s3.send(new import_client_s3.GetObjectCommand({
+            Bucket: MEMORY_BUCKET,
+            Key: `${ctx.owner}/${ctx.repo}/memory.md`
+          }));
+          const memory = await s3res.Body.transformToString();
+          if (memory)
+            sections.push(`## Repo memory (accumulated knowledge from previous reviews)
+${memory}`);
+        } catch {
+        }
       }
       return sections.length > 0 ? sections.join("\n\n") : "No project conventions configured. Apply general best practices.";
     }
@@ -4674,6 +4712,19 @@ ${footer.join(" ")}`;
       console.log(`[reviewer][comment] SUCCESS id=${created.id} url=${created.html_url}`);
       console.log(`[reviewer][comment] github attached to line=${created.line} start_line=${created.start_line ?? "(none)"} side=${created.side} original_line=${created.original_line}`);
       return "Comment posted successfully";
+    }
+    case "save_repo_memory": {
+      if (!MEMORY_BUCKET)
+        return "Memory storage not configured (BLIN_MEMORY_BUCKET not set)";
+      const key = `${ctx.owner}/${ctx.repo}/memory.md`;
+      await s3.send(new import_client_s3.PutObjectCommand({
+        Bucket: MEMORY_BUCKET,
+        Key: key,
+        Body: input.content,
+        ContentType: "text/markdown"
+      }));
+      console.log(`[reviewer][memory] saved s3://${MEMORY_BUCKET}/${key}`);
+      return "Memory saved successfully";
     }
     default:
       return `Unknown tool: ${name}`;

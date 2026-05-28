@@ -12,6 +12,7 @@
     "@octokit/app": "^15.0.0"
   },
   "devDependencies": {
+    "@aws-sdk/client-s3": "^3.1055.0",
     "tsx": "*",
     "typescript": "*"
   },
