@@ -4832,6 +4832,7 @@ ${footer.join(" ")}`;
       const created = await res.json();
       console.log(`[reviewer][comment] SUCCESS id=${created.id} url=${created.html_url}`);
       console.log(`[reviewer][comment] github attached to line=${created.line} start_line=${created.start_line ?? "(none)"} side=${created.side} original_line=${created.original_line}`);
+      ctx.commentsPosted++;
       return "Comment posted successfully";
     }
     case "save_repo_memory": {
@@ -4874,7 +4875,8 @@ function register3(bus, githubApp) {
         base: prData.base.ref,
         head: prData.head.ref
       },
-      diffMap: null
+      diffMap: null,
+      commentsPosted: 0
     };
     const userRequest = event.instructions ? `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}
 
@@ -4882,6 +4884,23 @@ Specific request from ${event.requestedBy}: ${event.instructions}` : `Review PR 
     await runAgentLoop(`[reviewer] PR #${event.pr.number}`, SYSTEM_PROMPT, TOOLS, [
       { role: "user", content: [{ text: userRequest }] }
     ], ctx);
+    if (ctx.commentsPosted === 0) {
+      const res = await fetch(`https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/issues/${event.pr.number}/comments`, {
+        method: "POST",
+        headers: {
+          "Authorization": `Bearer ${ctx.pat}`,
+          "Content-Type": "application/json",
+          "Accept": "application/vnd.github.v3+json"
+        },
+        body: JSON.stringify({ body: `Looks good to me \u{1F44D}
+<!-- blin -->` })
+      });
+      if (res.ok) {
+        console.log(`[reviewer] PR #${event.pr.number} LGTM comment posted`);
+      } else {
+        console.error(`[reviewer] failed to post LGTM comment: ${res.status}`);
+      }
+    }
   });
   bus.subscribe("review.thread_reply", async (event) => {
     console.log(`[reviewer] thread reply in PR #${event.pr.number} by ${event.reply.author}`);
@@ -4947,7 +4966,8 @@ Be concise. If their argument is valid, acknowledge it and explain if you're ret
         base: prData.base.ref,
         head: prData.head.ref
       },
-      diffMap: null
+      diffMap: null,
+      commentsPosted: 0
     };
     const threadExecuteTool = async (name, input) => {
       if (name === "read_file")

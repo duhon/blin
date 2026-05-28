@@ -349,6 +349,7 @@ interface ReviewContext {
   pat: string | undefined;
   pr: { title: string; body: string | null; base: string; head: string };
   diffMap: DiffMap | null;
+  commentsPosted: number;
 }
 
 async function loadDiffMap(ctx: ReviewContext): Promise<{ annotated: string; map: DiffMap }> {
@@ -588,6 +589,7 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
       const created = await res.json() as any;
       console.log(`[reviewer][comment] SUCCESS id=${created.id} url=${created.html_url}`);
       console.log(`[reviewer][comment] github attached to line=${created.line} start_line=${created.start_line ?? '(none)'} side=${created.side} original_line=${created.original_line}`);
+      ctx.commentsPosted++;
       return 'Comment posted successfully';
     }
 
@@ -636,6 +638,7 @@ export function register(bus: IEventBus, githubApp: App): void {
         head: prData.head.ref,
       },
       diffMap: null,
+      commentsPosted: 0,
     };
 
     const userRequest = event.instructions
@@ -645,6 +648,26 @@ export function register(bus: IEventBus, githubApp: App): void {
     await runAgentLoop(`[reviewer] PR #${event.pr.number}`, SYSTEM_PROMPT, TOOLS, [
       { role: 'user', content: [{ text: userRequest }] },
     ], ctx);
+
+    if (ctx.commentsPosted === 0) {
+      const res = await fetch(
+        `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/issues/${event.pr.number}/comments`,
+        {
+          method: 'POST',
+          headers: {
+            'Authorization': `Bearer ${ctx.pat}`,
+            'Content-Type': 'application/json',
+            'Accept': 'application/vnd.github.v3+json',
+          },
+          body: JSON.stringify({ body: `Looks good to me 👍\n<!-- blin -->` }),
+        }
+      );
+      if (res.ok) {
+        console.log(`[reviewer] PR #${event.pr.number} LGTM comment posted`);
+      } else {
+        console.error(`[reviewer] failed to post LGTM comment: ${res.status}`);
+      }
+    }
   });
 
   bus.subscribe<ReviewThreadReplyEvent>('review.thread_reply', async (event) => {
@@ -717,6 +740,7 @@ Be concise. If their argument is valid, acknowledge it and explain if you're ret
         head: prData.head.ref,
       },
       diffMap: null,
+      commentsPosted: 0,
     };
 
     const threadExecuteTool = async (name: string, input: any): Promise<string> => {
