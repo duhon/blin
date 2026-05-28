@@ -651,7 +651,7 @@ export function register(bus: IEventBus, githubApp: App): void {
 
     if (ctx.commentsPosted === 0) {
       const res = await fetch(
-        `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/issues/${event.pr.number}/comments`,
+        `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/reviews`,
         {
           method: 'POST',
           headers: {
@@ -659,13 +659,13 @@ export function register(bus: IEventBus, githubApp: App): void {
             'Content-Type': 'application/json',
             'Accept': 'application/vnd.github.v3+json',
           },
-          body: JSON.stringify({ body: `Looks good to me 👍\n<!-- blin -->` }),
+          body: JSON.stringify({ body: `Looks good to me 👍`, event: 'APPROVE' }),
         }
       );
       if (res.ok) {
-        console.log(`[reviewer] PR #${event.pr.number} LGTM comment posted`);
+        console.log(`[reviewer] PR #${event.pr.number} approved`);
       } else {
-        console.error(`[reviewer] failed to post LGTM comment: ${res.status}`);
+        console.error(`[reviewer] failed to approve PR: ${res.status} ${await res.text()}`);
       }
     }
   });

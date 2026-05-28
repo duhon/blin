@@ -4885,20 +4885,19 @@ Specific request from ${event.requestedBy}: ${event.instructions}` : `Review PR 
       { role: "user", content: [{ text: userRequest }] }
     ], ctx);
     if (ctx.commentsPosted === 0) {
-      const res = await fetch(`https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/issues/${event.pr.number}/comments`, {
+      const res = await fetch(`https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/reviews`, {
         method: "POST",
         headers: {
           "Authorization": `Bearer ${ctx.pat}`,
           "Content-Type": "application/json",
           "Accept": "application/vnd.github.v3+json"
         },
-        body: JSON.stringify({ body: `Looks good to me \u{1F44D}
-<!-- blin -->` })
+        body: JSON.stringify({ body: `Looks good to me \u{1F44D}`, event: "APPROVE" })
       });
       if (res.ok) {
-        console.log(`[reviewer] PR #${event.pr.number} LGTM comment posted`);
+        console.log(`[reviewer] PR #${event.pr.number} approved`);
       } else {
-        console.error(`[reviewer] failed to post LGTM comment: ${res.status}`);
+        console.error(`[reviewer] failed to approve PR: ${res.status} ${await res.text()}`);
       }
     }
   });
