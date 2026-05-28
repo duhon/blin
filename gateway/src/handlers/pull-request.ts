@@ -99,24 +99,22 @@ export async function handleReviewComment(
 
   if (payload.action !== 'created') return;
   if (!payload.comment.user || payload.comment.user.type === 'Bot') return;
-
-  const botMention = '@blin-bot';
-  if (!payload.comment.body.includes(botMention)) return;
+  if (!payload.comment.in_reply_to_id) return;
 
   const pr = payload.pull_request as unknown as PullRequestEvent['payload']['pull_request'];
-  const analystEvent: AnalystQuestionAskedEvent = {
-    type: 'analyst.question_asked',
+  const mentionEvent: PrMentionEvent = {
+    type: 'pr.mention',
     repo: {
       owner: payload.repository.owner.login,
       name: payload.repository.name,
       fullName: payload.repository.full_name,
     },
     pr: extractPr(pr),
+    comment: payload.comment.body,
     commentId: payload.comment.id,
-    question: payload.comment.body.replace(botMention, '').trim(),
-    askedBy: payload.comment.user.login,
+    author: payload.comment.user.login,
     installationId: payload.installation!.id,
   };
 
-  await bus.publish(analystEvent);
+  await bus.publish(mentionEvent);
 }
