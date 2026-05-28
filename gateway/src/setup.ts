@@ -2,6 +2,7 @@ import { App } from '@octokit/app';
 import { Webhooks } from '@octokit/webhooks';
 import { InMemoryEventBus } from '@blin/event-bus';
 import { registerWebhookHandlers } from './router.js';
+import { register as registerButler } from '@blin/butler';
 import { register as registerReviewer } from '@blin/reviewer';
 import { register as registerAnalyst } from '@blin/analyst';
 import { register as registerTester } from '@blin/tester';
@@ -24,6 +25,7 @@ export function createWebhooks(): Webhooks {
   const webhooks = new Webhooks({ secret: process.env.GITHUB_WEBHOOK_SECRET! });
 
   registerWebhookHandlers(webhooks, bus);
+  registerButler(bus, githubApp);
   registerReviewer(bus, githubApp);
   registerAnalyst(bus, githubApp);
   registerTester(bus, githubApp);

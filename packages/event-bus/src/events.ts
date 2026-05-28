@@ -64,6 +64,17 @@ export interface CheckRunCompletedEvent {
   installationId: number;
 }
 
+// Butler
+export interface PrMentionEvent {
+  type: 'pr.mention';
+  repo: Repository;
+  pr: PullRequest;
+  comment: string;
+  commentId: number;
+  author: string;
+  installationId: number;
+}
+
 // Release Manager
 export interface ReleaseRequestedEvent {
   type: 'release.requested';
@@ -89,6 +100,7 @@ export type BlinEvent =
   | TestsRunRequestedEvent
   | CheckRunCompletedEvent
   | ReleaseRequestedEvent
-  | EnvironmentRequestedEvent;
+  | EnvironmentRequestedEvent
+  | PrMentionEvent;
 
 export type EventType = BlinEvent['type'];

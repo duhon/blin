@@ -1,4 +1,4 @@
-import type { IEventBus, ReviewRequestedEvent, AnalystQuestionAskedEvent } from '@blin/event-bus';
+import type { IEventBus, ReviewRequestedEvent, AnalystQuestionAskedEvent, PrMentionEvent } from '@blin/event-bus';
 import type { EmitterWebhookEvent } from '@octokit/webhooks';
 
 type PullRequestEvent = EmitterWebhookEvent<'pull_request'>;
@@ -66,12 +66,10 @@ export async function handleIssueComment(
   if (payload.action !== 'created') return;
   if (!payload.comment.user || payload.comment.user.type === 'Bot') return;
   if (!payload.issue.pull_request) return;
+  if (!payload.comment.body.toLowerCase().includes('@duhon')) return;
 
-  const trigger = '@duhon review';
-  if (!payload.comment.body.toLowerCase().includes(trigger)) return;
-
-  const reviewEvent: ReviewRequestedEvent = {
-    type: 'review.requested',
+  const mentionEvent: PrMentionEvent = {
+    type: 'pr.mention',
     repo: {
       owner: payload.repository.owner.login,
       name: payload.repository.name,
@@ -84,11 +82,13 @@ export async function handleIssueComment(
       base: '',
       head: '',
     },
-    requestedBy: payload.comment.user.login,
+    comment: payload.comment.body,
+    commentId: payload.comment.id,
+    author: payload.comment.user.login,
     installationId: payload.installation!.id,
   };
 
-  await bus.publish(reviewEvent);
+  await bus.publish(mentionEvent);
 }
 
 export async function handleReviewComment(

@@ -3920,10 +3920,9 @@ async function handleIssueComment(event, bus) {
   if (payload.action !== "created") return;
   if (!payload.comment.user || payload.comment.user.type === "Bot") return;
   if (!payload.issue.pull_request) return;
-  const trigger = "@duhon review";
-  if (!payload.comment.body.toLowerCase().includes(trigger)) return;
-  const reviewEvent = {
-    type: "review.requested",
+  if (!payload.comment.body.toLowerCase().includes("@duhon")) return;
+  const mentionEvent = {
+    type: "pr.mention",
     repo: {
       owner: payload.repository.owner.login,
       name: payload.repository.name,
@@ -3936,10 +3935,12 @@ async function handleIssueComment(event, bus) {
       base: "",
       head: ""
     },
-    requestedBy: payload.comment.user.login,
+    comment: payload.comment.body,
+    commentId: payload.comment.id,
+    author: payload.comment.user.login,
     installationId: payload.installation.id
   };
-  await bus.publish(reviewEvent);
+  await bus.publish(mentionEvent);
 }
 async function handleReviewComment(event, bus) {
   const { payload } = event;
@@ -4002,6 +4003,72 @@ function registerWebhookHandlers(webhooks3, bus) {
   webhooks3.on("check_run", (event) => handleCheckRun(event, bus));
   webhooks3.onError((error) => {
     console.error("[gateway] webhook error:", error.message);
+  });
+}
+
+// ../services/butler/dist/index.js
+var BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-6";
+async function classifyIntent(comment) {
+  const region = process.env.AWS_REGION ?? "us-east-1";
+  const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
+  const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL)}/converse`;
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      system: [{ text: `You are a dispatcher for a GitHub bot. Classify the user's intent from their PR comment.
+Reply with exactly one word:
+- "review" \u2014 user wants a code review of the PR
+- "question" \u2014 user is asking a question about the code, the PR, or how something works
+- "unknown" \u2014 anything else` }],
+      messages: [{ role: "user", content: [{ text: comment }] }]
+    })
+  });
+  if (!response.ok) {
+    console.error(`[butler] bedrock error: ${response.status}`);
+    return "unknown";
+  }
+  const data = await response.json();
+  const text = data.output?.message?.content?.[0]?.text?.trim().toLowerCase() ?? "";
+  console.log(`[butler] classified "${comment.slice(0, 80)}" \u2192 ${text}`);
+  if (text.startsWith("review"))
+    return "review";
+  if (text.startsWith("question"))
+    return "question";
+  return "unknown";
+}
+function register2(bus, githubApp) {
+  bus.subscribe("pr.mention", async (event) => {
+    console.log(`[butler] mention in PR #${event.pr.number} by ${event.author}: ${event.comment.slice(0, 100)}`);
+    const intent = await classifyIntent(event.comment);
+    if (intent === "review") {
+      const reviewEvent = {
+        type: "review.requested",
+        repo: event.repo,
+        pr: event.pr,
+        requestedBy: event.author,
+        installationId: event.installationId
+      };
+      await bus.publish(reviewEvent);
+      return;
+    }
+    if (intent === "question") {
+      const questionEvent = {
+        type: "analyst.question_asked",
+        repo: event.repo,
+        pr: event.pr,
+        commentId: event.commentId,
+        question: event.comment,
+        askedBy: event.author,
+        installationId: event.installationId
+      };
+      await bus.publish(questionEvent);
+      return;
+    }
+    console.log(`[butler] unknown intent, ignoring`);
   });
 }
 
@@ -4200,7 +4267,7 @@ var knowledgePacks = {
 // ../services/reviewer/dist/index.js
 var s3 = new import_client_s3.S3Client({});
 var MEMORY_BUCKET = process.env.BLIN_MEMORY_BUCKET;
-var BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-6";
+var BEDROCK_MODEL2 = "us.anthropic.claude-sonnet-4-6";
 var MAX_ITERATIONS = 20;
 var DEFAULT_READ_LIMIT = 200;
 var MAX_READ_LIMIT = 1e3;
@@ -4211,7 +4278,7 @@ var DEFAULT_CONFIG = {
 async function callBedrock(systemPrompt, messages, tools) {
   const region = process.env.AWS_REGION ?? "us-east-1";
   const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
-  const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL)}/converse`;
+  const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL2)}/converse`;
   const response = await fetch(url, {
     method: "POST",
     headers: {
@@ -4745,7 +4812,7 @@ ${footer.join(" ")}`;
       return `Unknown tool: ${name}`;
   }
 }
-function register2(bus, githubApp) {
+function register3(bus, githubApp) {
   bus.subscribe("review.requested", async (event) => {
     console.log(`[reviewer] reviewing PR #${event.pr.number} in ${event.repo.fullName}`);
     const octokit = await githubApp.getInstallationOctokit(event.installationId);
@@ -4807,7 +4874,7 @@ function register2(bus, githubApp) {
 }
 
 // ../services/analyst/dist/index.js
-function register3(bus, githubApp) {
+function register4(bus, githubApp) {
   bus.subscribe("analyst.question_asked", async (event) => {
     console.log(`[analyst] question in PR #${event.pr.number} from ${event.askedBy}`);
     console.log(`[analyst] would create discussion for PR #${event.pr.number} (mock)`);
@@ -4815,7 +4882,7 @@ function register3(bus, githubApp) {
 }
 
 // ../services/tester/dist/index.js
-function register4(bus, githubApp) {
+function register5(bus, githubApp) {
   bus.subscribe("tests.check_run_completed", async (event) => {
     console.log(`[tester] check run failed: ${event.checkRunName} in PR #${event.pr.number}`);
     console.log(`[tester] would post CI analysis for PR #${event.pr.number} (mock)`);
@@ -4823,7 +4890,7 @@ function register4(bus, githubApp) {
 }
 
 // ../services/release-manager/dist/index.js
-function register5(bus, githubApp) {
+function register6(bus, githubApp) {
   bus.subscribe("release.requested", async (event) => {
     console.log(`[release-manager] release ${event.version} requested in ${event.repo.fullName}`);
     console.log(`[release-manager] would create release ${event.version} (mock)`);
@@ -4831,7 +4898,7 @@ function register5(bus, githubApp) {
 }
 
 // ../services/environment-manager/dist/index.js
-function register6(bus, githubApp) {
+function register7(bus, githubApp) {
   bus.subscribe("environment.requested", async (event) => {
     console.log(`[environment-manager] preview requested for PR #${event.pr.number}`);
     console.log(`[environment-manager] would create deployment for PR #${event.pr.number} (mock)`);
@@ -4854,6 +4921,7 @@ function createWebhooks() {
   register4(bus, githubApp);
   register5(bus, githubApp);
   register6(bus, githubApp);
+  register7(bus, githubApp);
   return webhooks3;
 }
 
