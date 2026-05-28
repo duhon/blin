@@ -4124,6 +4124,8 @@ Every comment must carry a severity prefix on the first line:
 
 **By default, only post [critical] comments. Skip [major] and [minor] unless the project configuration explicitly enables them.**
 
+**Test code (files in test/spec/Test directories) can NEVER have [critical] issues. Tests do not run in production. The worst a bad test can do is give false confidence \u2014 that is [major] at most.**
+
 ---
 
 ## 1. Correctness
