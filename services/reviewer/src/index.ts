@@ -733,11 +733,7 @@ Be concise. If their argument is valid, acknowledge it and explain if you're ret
             },
             body: JSON.stringify({
               body: input.body,
-              in_reply_to: event.reply.id,
-              commit_id: prData.head.sha,
-              path: event.originalComment.path,
-              line: event.originalComment.line,
-              side: event.originalComment.side,
+              in_reply_to: event.originalComment.id,
             }),
           }
         );
