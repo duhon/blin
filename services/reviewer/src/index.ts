@@ -1,5 +1,5 @@
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import type { IEventBus, ReviewRequestedEvent } from '@blin/event-bus';
+import type { IEventBus, ReviewRequestedEvent, ReviewThreadReplyEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
 import { knowledgePacks } from './knowledge/index.js';
 
@@ -345,6 +345,7 @@ interface ReviewContext {
   repo: string;
   pullNumber: number;
   headSha: string;
+  defaultBranch: string;
   pat: string | undefined;
   pr: { title: string; body: string | null; base: string; head: string };
   diffMap: DiffMap | null;
@@ -626,6 +627,7 @@ export function register(bus: IEventBus, githubApp: App): void {
       repo: event.repo.name,
       pullNumber: event.pr.number,
       headSha: prData.head.sha,
+      defaultBranch: prData.base.repo.default_branch,
       pat: process.env.GITHUB_REVIEWER_PAT,
       pr: {
         title: event.pr.title,
@@ -640,39 +642,174 @@ export function register(bus: IEventBus, githubApp: App): void {
       { role: 'user', content: [{ text: `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}` }] },
     ];
 
-    for (let i = 0; i < MAX_ITERATIONS; i++) {
-      console.log(`[reviewer] --- iteration ${i + 1}/${MAX_ITERATIONS} ---`);
-      const response = await callBedrock(SYSTEM_PROMPT, messages, TOOLS);
-      messages.push({ role: 'assistant', content: response.content });
-
-      for (const block of response.content) {
-        if (block.text) {
-          console.log(`[reviewer] claude text: ${block.text.slice(0, 300)}${block.text.length > 300 ? '...' : ''}`);
-        }
-      }
-
-      if (response.stopReason === 'end_turn') {
-        console.log(`[reviewer] done PR #${event.pr.number}`);
-        break;
-      }
-
-      const toolResults: any[] = [];
-      for (const block of response.content) {
-        if (block.toolUse) {
-          console.log(`[reviewer] tool: ${block.toolUse.name} input=${JSON.stringify(block.toolUse.input).slice(0, 500)}`);
-          const result = await executeTool(block.toolUse.name, block.toolUse.input, ctx);
-          console.log(`[reviewer] tool result (first 300 chars): ${result.slice(0, 300)}${result.length > 300 ? '...' : ''}`);
-          toolResults.push({
-            toolResult: {
-              toolUseId: block.toolUse.toolUseId,
-              content: [{ text: result }],
-            },
-          });
-        }
-      }
-
-      if (toolResults.length === 0) break;
-      messages.push({ role: 'user', content: toolResults });
-    }
+    await runAgentLoop(`[reviewer] PR #${event.pr.number}`, SYSTEM_PROMPT, TOOLS, [
+      { role: 'user', content: [{ text: `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}` }] },
+    ], ctx);
   });
+
+  bus.subscribe<ReviewThreadReplyEvent>('review.thread_reply', async (event) => {
+    console.log(`[reviewer] thread reply in PR #${event.pr.number} by ${event.reply.author}`);
+
+    const octokit = await githubApp.getInstallationOctokit(event.installationId);
+    const pat = process.env.GITHUB_REVIEWER_PAT;
+
+    const THREAD_SYSTEM_PROMPT = `You are a senior engineer who posted an inline code review comment. Someone has replied to your comment — read their reply, consider their argument, and respond directly in the thread.
+
+You can use read_file to look up more context if needed.
+
+To post your reply, call reply_to_thread with your response text.
+
+Be concise. If their argument is valid, acknowledge it and explain if you're retracting the finding. If you still believe the issue is real, explain why clearly. Do not repeat the original finding verbatim.`;
+
+    const THREAD_TOOLS = [
+      {
+        toolSpec: {
+          name: 'read_file',
+          description: `Read a slice of a file in the repository for context.`,
+          inputSchema: {
+            json: {
+              type: 'object',
+              properties: {
+                path: { type: 'string', description: 'File path relative to repo root' },
+                offset: { type: 'number', description: '1-based line to start from. Default 1.' },
+                limit: { type: 'number', description: `Max lines to return. Default ${DEFAULT_READ_LIMIT}, max ${MAX_READ_LIMIT}.` },
+              },
+              required: ['path'],
+            },
+          },
+        },
+      },
+      {
+        toolSpec: {
+          name: 'reply_to_thread',
+          description: 'Post a reply in the review thread.',
+          inputSchema: {
+            json: {
+              type: 'object',
+              properties: {
+                body: { type: 'string', description: 'Your reply text (GitHub markdown).' },
+              },
+              required: ['body'],
+            },
+          },
+        },
+      },
+    ];
+
+    const { data: prData } = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+      owner: event.repo.owner,
+      repo: event.repo.name,
+      pull_number: event.pr.number,
+    });
+
+    const ctx: ReviewContext = {
+      octokit,
+      owner: event.repo.owner,
+      repo: event.repo.name,
+      pullNumber: event.pr.number,
+      headSha: prData.head.sha,
+      defaultBranch: prData.base.repo.default_branch,
+      pat,
+      pr: {
+        title: event.pr.title,
+        body: event.pr.body,
+        base: prData.base.ref,
+        head: prData.head.ref,
+      },
+      diffMap: null,
+    };
+
+    const threadExecuteTool = async (name: string, input: any): Promise<string> => {
+      if (name === 'read_file') return executeTool('read_file', input, ctx);
+      if (name === 'reply_to_thread') {
+        const res = await fetch(
+          `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/comments`,
+          {
+            method: 'POST',
+            headers: {
+              'Authorization': `Bearer ${pat}`,
+              'Content-Type': 'application/json',
+              'Accept': 'application/vnd.github.v3+json',
+            },
+            body: JSON.stringify({
+              body: input.body,
+              in_reply_to: event.reply.id,
+              commit_id: prData.head.sha,
+              path: event.originalComment.path,
+              line: event.originalComment.line,
+              side: event.originalComment.side,
+            }),
+          }
+        );
+        if (!res.ok) {
+          const err = await res.text();
+          console.error(`[reviewer][thread] reply failed (${res.status}): ${err}`);
+          return `Failed to post reply: ${err}`;
+        }
+        console.log(`[reviewer][thread] reply posted`);
+        return 'Reply posted successfully';
+      }
+      return `Unknown tool: ${name}`;
+    };
+
+    const initialMessage = `You previously commented on \`${event.originalComment.path}\` line ${event.originalComment.line}:
+
+> ${event.originalComment.body}
+
+${event.reply.author} replied:
+
+> ${event.reply.body}
+
+Respond to their reply.`;
+
+    await runAgentLoop(`[reviewer] thread PR #${event.pr.number}`, THREAD_SYSTEM_PROMPT, THREAD_TOOLS, [
+      { role: 'user', content: [{ text: initialMessage }] },
+    ], ctx, threadExecuteTool);
+  });
+}
+
+async function runAgentLoop(
+  logPrefix: string,
+  systemPrompt: string,
+  tools: any[],
+  messages: any[],
+  ctx: ReviewContext,
+  toolExecutor?: (name: string, input: any) => Promise<string>
+): Promise<void> {
+  for (let i = 0; i < MAX_ITERATIONS; i++) {
+    console.log(`${logPrefix} --- iteration ${i + 1}/${MAX_ITERATIONS} ---`);
+    const response = await callBedrock(systemPrompt, messages, tools);
+    messages.push({ role: 'assistant', content: response.content });
+
+    for (const block of response.content) {
+      if (block.text) {
+        console.log(`${logPrefix} claude text: ${block.text.slice(0, 300)}${block.text.length > 300 ? '...' : ''}`);
+      }
+    }
+
+    if (response.stopReason === 'end_turn') {
+      console.log(`${logPrefix} done`);
+      break;
+    }
+
+    const toolResults: any[] = [];
+    for (const block of response.content) {
+      if (block.toolUse) {
+        console.log(`${logPrefix} tool: ${block.toolUse.name} input=${JSON.stringify(block.toolUse.input).slice(0, 500)}`);
+        const result = toolExecutor
+          ? await toolExecutor(block.toolUse.name, block.toolUse.input)
+          : await executeTool(block.toolUse.name, block.toolUse.input, ctx);
+        console.log(`${logPrefix} tool result (first 300 chars): ${result.slice(0, 300)}${result.length > 300 ? '...' : ''}`);
+        toolResults.push({
+          toolResult: {
+            toolUseId: block.toolUse.toolUseId,
+            content: [{ text: result }],
+          },
+        });
+      }
+    }
+
+    if (toolResults.length === 0) break;
+    messages.push({ role: 'user', content: toolResults });
+  }
 }

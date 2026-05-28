@@ -112,6 +112,7 @@ export async function handleReviewComment(
     pr: extractPr(pr),
     comment: payload.comment.body,
     commentId: payload.comment.id,
+    inReplyToId: payload.comment.in_reply_to_id ?? undefined,
     author: payload.comment.user.login,
     installationId: payload.installation!.id,
   };

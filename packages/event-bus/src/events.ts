@@ -71,7 +71,17 @@ export interface PrMentionEvent {
   pr: PullRequest;
   comment: string;
   commentId: number;
+  inReplyToId?: number;
   author: string;
+  installationId: number;
+}
+
+export interface ReviewThreadReplyEvent {
+  type: 'review.thread_reply';
+  repo: Repository;
+  pr: PullRequest;
+  originalComment: { id: number; body: string; path: string; line: number; side: string };
+  reply: { id: number; body: string; author: string };
   installationId: number;
 }
 
@@ -101,6 +111,7 @@ export type BlinEvent =
   | CheckRunCompletedEvent
   | ReleaseRequestedEvent
   | EnvironmentRequestedEvent
-  | PrMentionEvent;
+  | PrMentionEvent
+  | ReviewThreadReplyEvent;
 
 export type EventType = BlinEvent['type'];
