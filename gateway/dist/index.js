@@ -4454,7 +4454,10 @@ Your review process:
 5. create_inline_comment \u2014 post comments for real issues found
 6. Use \`\`\`suggestion blocks when you have a concrete fix
 
-Be thorough but only report real issues. Skip style nitpicks.
+Severity filter \u2014 STRICT RULE:
+- Post ONLY comments labelled [critical] (blocks merge, will cause crash/outage/data loss/security breach)
+- NEVER post [major] or [minor] comments unless the project conventions explicitly say otherwise
+- When in doubt whether something is critical or major \u2014 skip it
 
 Rules for inline comments:
 - The diff from get_pr_diff annotates every line with its exact line number: \`+[RIGHT:42]\` means added line 42 (use side=RIGHT, line=42), \`-[LEFT:41]\` means removed line 41 (use side=LEFT, line=41), \` [RIGHT:42]\` means context line 42 (use side=RIGHT, line=42)
