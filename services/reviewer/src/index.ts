@@ -361,6 +361,35 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
         }
       }
 
+      // Auto-detect runtime constraints from project manifests
+      const composerJson = await readFile('composer.json');
+      if (composerJson) {
+        try {
+          const composer = JSON.parse(composerJson);
+          const constraints: string[] = [];
+          if (composer.require?.php) constraints.push(`php: ${composer.require.php}`);
+          const extensions = Object.entries(composer.require ?? {})
+            .filter(([k]) => k.startsWith('ext-'))
+            .map(([k, v]) => `${k}: ${v}`);
+          if (extensions.length) constraints.push(...extensions);
+          if (composer['require-dev']?.php) constraints.push(`php (dev): ${composer['require-dev'].php}`);
+          if (constraints.length) {
+            sections.push(`## Project runtime constraints (composer.json)\n${constraints.map(c => `- ${c}`).join('\n')}\n\nDo NOT flag issues that only affect versions outside these constraints.`);
+          }
+        } catch {}
+      }
+
+      const packageJson = await readFile('package.json');
+      if (packageJson) {
+        try {
+          const pkg = JSON.parse(packageJson);
+          if (pkg.engines && Object.keys(pkg.engines).length > 0) {
+            const engines = Object.entries(pkg.engines).map(([k, v]) => `- ${k}: ${v}`).join('\n');
+            sections.push(`## Project runtime constraints (package.json)\n${engines}\n\nDo NOT flag issues that only affect versions outside these constraints.`);
+          }
+        } catch {}
+      }
+
       for (const path of contextFiles) {
         const content = await readFile(path);
         if (content) sections.push(`## ${path}\n${content}`);
