@@ -8,7 +8,7 @@ const DEFAULT_READ_LIMIT = 200;
 const MAX_READ_LIMIT = 1000;
 
 const DEFAULT_CONFIG = {
-  knowledge: [] as string[],
+  knowledge: ['basic'] as string[],
   context_files: [] as string[],
 };
 
