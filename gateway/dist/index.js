@@ -4376,14 +4376,29 @@ var TOOLS = [
   {
     toolSpec: {
       name: "save_repo_memory",
-      description: "Persist accumulated knowledge about this repository to S3 for future reviews. Call this at the end of every review. Merge new facts with existing memory \u2014 do not discard what was already there.",
+      description: `Persist accumulated knowledge about this repository to S3 for future reviews. Call this at the end of every review. Merge new facts with existing memory \u2014 never discard what was already there, only add or correct.
+
+STRICT FORMAT \u2014 output exactly these four sections, no others:
+
+## Architecture
+Key architectural patterns, module structure, DI conventions, layer boundaries. Omit runtime versions \u2014 those are auto-detected from composer.json/package.json.
+
+## Conventions
+Coding conventions, test patterns, fixture conventions, naming rules specific to this repo. Only things not obvious from the language/framework.
+
+## False positives \u2014 do not flag
+Bullet list of finding categories that are NOT real issues in this repo. Be specific about WHY each is safe here.
+Example: "- Missing setAccessible() before setValue() \u2014 repo requires PHP >=8.1 where it is optional"
+
+## Patterns to watch
+Recurring risky patterns specific to this codebase that are worth flagging when seen again. Be specific.`,
       inputSchema: {
         json: {
           type: "object",
           properties: {
             content: {
               type: "string",
-              description: "Full markdown content of the memory. Include: runtime versions, framework/stack, key architectural patterns, repo-specific conventions, and categories of findings that turned out to be false positives in this repo."
+              description: "Memory content following the strict four-section format described above."
             }
           },
           required: ["content"]
