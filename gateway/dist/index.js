@@ -3947,6 +3947,7 @@ async function handleReviewComment(event, bus) {
   if (payload.action !== "created") return;
   if (!payload.comment.user || payload.comment.user.type === "Bot") return;
   if (!payload.comment.in_reply_to_id) return;
+  if (payload.comment.body.includes("<!-- blin -->")) return;
   const pr = payload.pull_request;
   const mentionEvent = {
     type: "pr.mention",
@@ -4960,7 +4961,8 @@ Be concise. If their argument is valid, acknowledge it and explain if you're ret
             "Accept": "application/vnd.github.v3+json"
           },
           body: JSON.stringify({
-            body: input.body,
+            body: `${input.body}
+<!-- blin -->`,
             in_reply_to: event.originalComment.id
           })
         });

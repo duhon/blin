@@ -100,6 +100,7 @@ export async function handleReviewComment(
   if (payload.action !== 'created') return;
   if (!payload.comment.user || payload.comment.user.type === 'Bot') return;
   if (!payload.comment.in_reply_to_id) return;
+  if (payload.comment.body.includes('<!-- blin -->')) return;
 
   const pr = payload.pull_request as unknown as PullRequestEvent['payload']['pull_request'];
   const mentionEvent: PrMentionEvent = {

@@ -732,7 +732,7 @@ Be concise. If their argument is valid, acknowledge it and explain if you're ret
               'Accept': 'application/vnd.github.v3+json',
             },
             body: JSON.stringify({
-              body: input.body,
+              body: `${input.body}\n<!-- blin -->`,
               in_reply_to: event.originalComment.id,
             }),
           }
