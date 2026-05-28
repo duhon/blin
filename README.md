@@ -20,7 +20,7 @@ reviewer:
     - .github/CONVENTIONS.md   # project-specific conventions
 ```
 
-That's it. Add yourself as a reviewer on any PR — blin will post an inline code review.
+That's it. Mention `@duhon` in any PR comment — blin will understand what you need and route it to the right service.
 
 ---
 
@@ -31,10 +31,12 @@ GitHub Webhook → AWS Lambda → InMemoryEventBus → Services → GitHub API
 ```
 
 - **Gateway** — receives webhooks, routes events to services via event bus
+- **Butler** — AI dispatcher: classifies intent from PR mentions and routes to the right service
 - **Reviewer** — agentic loop: reads project conventions, explores PR context, posts inline comments
 - **Event Bus** — in-memory, interface allows swapping to Redis/RabbitMQ later
 - **AI** — AWS Bedrock (Claude Sonnet)
 - **Knowledge packs** — global best practices (e.g. Magento 2) bundled into the service, enabled per repo via `blin.yml`
+- **Semantic memory** — per-repo knowledge accumulated across reviews, stored in S3
 
 ## Configuration
 
@@ -46,10 +48,19 @@ Each repository can configure blin via `.github/blin.yml`:
 
 ## Services
 
+### Butler
+Natural language dispatcher — the entry point for all interactions.
+
+Mention `@duhon` in any PR comment with a natural language request:
+- `@duhon can you review this?` → triggers Reviewer
+- `@duhon how does this module work?` → triggers Analyst
+
+---
+
 ### Reviewer
 #### Review code
-- When explicitly requested as a reviewer
-- On demand via the "Re-request review" button
+- When requested via `@duhon` mention
+- When explicitly requested as a reviewer via GitHub UI
 
 #### Discuss
 - Reply to comments in review threads
