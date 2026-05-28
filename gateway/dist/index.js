@@ -4085,6 +4085,7 @@ function register2(bus, githubApp) {
         repo: event.repo,
         pr: event.pr,
         requestedBy: event.author,
+        instructions: event.comment,
         installationId: event.installationId
       };
       await bus.publish(reviewEvent);
@@ -4872,11 +4873,11 @@ function register3(bus, githubApp) {
       },
       diffMap: null
     };
-    const messages = [
-      { role: "user", content: [{ text: `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}` }] }
-    ];
+    const userRequest = event.instructions ? `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}
+
+Specific request from ${event.requestedBy}: ${event.instructions}` : `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}`;
     await runAgentLoop(`[reviewer] PR #${event.pr.number}`, SYSTEM_PROMPT, TOOLS, [
-      { role: "user", content: [{ text: `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}` }] }
+      { role: "user", content: [{ text: userRequest }] }
     ], ctx);
   });
   bus.subscribe("review.thread_reply", async (event) => {

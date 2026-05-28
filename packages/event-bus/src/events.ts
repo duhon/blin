@@ -18,6 +18,7 @@ export interface ReviewRequestedEvent {
   repo: Repository;
   pr: PullRequest;
   requestedBy: string;
+  instructions?: string;
   installationId: number;
 }
 

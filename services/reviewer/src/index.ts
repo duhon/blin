@@ -638,12 +638,12 @@ export function register(bus: IEventBus, githubApp: App): void {
       diffMap: null,
     };
 
-    const messages: any[] = [
-      { role: 'user', content: [{ text: `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}` }] },
-    ];
+    const userRequest = event.instructions
+      ? `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}\n\nSpecific request from ${event.requestedBy}: ${event.instructions}`
+      : `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}`;
 
     await runAgentLoop(`[reviewer] PR #${event.pr.number}`, SYSTEM_PROMPT, TOOLS, [
-      { role: 'user', content: [{ text: `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}` }] },
+      { role: 'user', content: [{ text: userRequest }] },
     ], ctx);
   });
 

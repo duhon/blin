@@ -90,6 +90,7 @@ export function register(bus: IEventBus, githubApp: App): void {
         repo: event.repo,
         pr: event.pr,
         requestedBy: event.author,
+        instructions: event.comment,
         installationId: event.installationId,
       };
       await bus.publish(reviewEvent);
