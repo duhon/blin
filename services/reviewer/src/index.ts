@@ -723,7 +723,7 @@ Be concise. If their argument is valid, acknowledge it and explain if you're ret
       if (name === 'read_file') return executeTool('read_file', input, ctx);
       if (name === 'reply_to_thread') {
         const res = await fetch(
-          `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/comments`,
+          `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/comments`,
           {
             method: 'POST',
             headers: {
