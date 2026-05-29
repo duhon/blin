@@ -1,5 +1,6 @@
-import type { IEventBus, CheckRunCompletedEvent } from '@blin/event-bus';
+import type { IEventBus, CheckRunCompletedEvent, TestAnalysisRequestedEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
+import type { Octokit } from '@octokit/core';
 
 const BEDROCK_MODEL = 'us.anthropic.claude-sonnet-4-6';
 
@@ -132,7 +133,74 @@ async function analyzeFailures(buildConfig: string, failures: TestFailure[]): Pr
   return data.output?.message?.content?.[0]?.text?.trim() ?? '';
 }
 
+async function postComment(
+  octokit: Octokit,
+  repo: { owner: string; name: string },
+  prNumber: number,
+  body: string,
+): Promise<void> {
+  await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', {
+    owner: repo.owner,
+    repo: repo.name,
+    issue_number: prNumber,
+    body: `${body}\n<!-- blin -->`,
+  });
+}
+
+/**
+ * Analyze one failed check run's PHPUnit report and post the result as a PR
+ * comment. Returns true if a comment was posted, false if there was nothing to
+ * analyze (e.g. non-PHPUnit check with no console-error-logs link).
+ */
+async function analyzeAndPost(
+  octokit: Octokit,
+  repo: { owner: string; name: string },
+  prNumber: number,
+  checkRunName: string,
+  output: { summary?: string | null; text?: string | null },
+): Promise<boolean> {
+  const summary = output.summary ?? '';
+  const logUrl = findConsoleLogUrl(summary);
+  if (!logUrl) {
+    console.log(`[tester] no console-error-logs link in "${checkRunName}", skipping (non-PHPUnit check)`);
+    return false;
+  }
+
+  let failures: TestFailure[];
+  try {
+    const res = await fetch(logUrl);
+    if (!res.ok) {
+      console.error(`[tester] failed to fetch report ${logUrl}: ${res.status}`);
+      return false;
+    }
+    failures = parseConsoleErrors(await res.text());
+  } catch (err) {
+    console.error(`[tester] error fetching/parsing report ${logUrl}:`, err);
+    return false;
+  }
+
+  if (failures.length === 0) {
+    console.log(`[tester] no failing tests parsed from "${checkRunName}", skipping`);
+    return false;
+  }
+  console.log(`[tester] parsed ${failures.length} failing test run(s) from "${checkRunName}"`);
+
+  let analysis: string;
+  try {
+    analysis = await analyzeFailures(extractBuildConfig(output.text ?? ''), failures);
+  } catch (err) {
+    console.error(`[tester] analysis failed for "${checkRunName}":`, err);
+    return false;
+  }
+  if (!analysis) return false;
+
+  await postComment(octokit, repo, prNumber, `## 🧪 Test failure analysis — ${checkRunName}\n\n${analysis}`);
+  console.log(`[tester] posted failure analysis for "${checkRunName}" on PR #${prNumber}`);
+  return true;
+}
+
 export function register(bus: IEventBus, githubApp: App): void {
+  // Automatic: a check run finished with a failure.
   bus.subscribe<CheckRunCompletedEvent>('tests.check_run_completed', async (event) => {
     if (event.conclusion !== 'failure') {
       console.log(`[tester] check run ${event.checkRunName} concluded ${event.conclusion}, skipping`);
@@ -141,76 +209,64 @@ export function register(bus: IEventBus, githubApp: App): void {
     console.log(`[tester] analyzing failed check run "${event.checkRunName}" in PR #${event.pr.number}`);
 
     const octokit = await githubApp.getInstallationOctokit(event.installationId);
-
-    // 1. Fetch the check run to read its output (summary links + build config).
-    let summary = '';
-    let text = '';
     try {
       const { data } = await octokit.request('GET /repos/{owner}/{repo}/check-runs/{check_run_id}', {
         owner: event.repo.owner,
         repo: event.repo.name,
         check_run_id: event.checkRunId,
       });
-      summary = data.output?.summary ?? '';
-      text = data.output?.text ?? '';
+      await analyzeAndPost(octokit, event.repo, event.pr.number, event.checkRunName, data.output);
     } catch (err) {
-      console.error(`[tester] failed to fetch check run ${event.checkRunId}:`, err);
-      return;
+      console.error(`[tester] failed to handle check run ${event.checkRunId}:`, err);
     }
+  });
 
-    // 2. Locate the PHPUnit console-error-logs report.
-    const logUrl = findConsoleLogUrl(summary);
-    if (!logUrl) {
-      console.log(`[tester] no console-error-logs link in "${event.checkRunName}", skipping (non-PHPUnit check)`);
-      return;
-    }
+  // On-demand: someone asked (via PR comment) to analyze the PR's current
+  // failures. Find the failing checks and fan out one tests.check_run_completed
+  // event per check, so each is analyzed independently and in parallel (rather
+  // than one giant analysis that risks token/time limits with many failures).
+  bus.subscribe<TestAnalysisRequestedEvent>('tests.analysis_requested', async (event) => {
+    console.log(`[tester] on-demand analysis for PR #${event.pr.number} requested by ${event.requestedBy}`);
+    const octokit = await githubApp.getInstallationOctokit(event.installationId);
 
-    // 3. Fetch and parse the report (public host, no auth).
-    let failures: TestFailure[];
     try {
-      const res = await fetch(logUrl);
-      if (!res.ok) {
-        console.error(`[tester] failed to fetch report ${logUrl}: ${res.status}`);
-        return;
-      }
-      failures = parseConsoleErrors(await res.text());
-    } catch (err) {
-      console.error(`[tester] error fetching/parsing report ${logUrl}:`, err);
-      return;
-    }
-
-    if (failures.length === 0) {
-      console.log(`[tester] no failing tests parsed from report, skipping`);
-      return;
-    }
-    console.log(`[tester] parsed ${failures.length} failing test run(s) from report`);
-
-    // 4. Analyze, factoring in the build configuration.
-    const buildConfig = extractBuildConfig(text);
-    let analysis: string;
-    try {
-      analysis = await analyzeFailures(buildConfig, failures);
-    } catch (err) {
-      console.error(`[tester] analysis failed:`, err);
-      return;
-    }
-    if (!analysis) {
-      console.log(`[tester] empty analysis, skipping`);
-      return;
-    }
-
-    // 5. Post the analysis as a PR comment.
-    const body = `## 🧪 Test failure analysis — ${event.checkRunName}\n\n${analysis}\n<!-- blin -->`;
-    try {
-      await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', {
+      // The PR object from a comment lacks the head sha — fetch it.
+      const { data: pr } = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
         owner: event.repo.owner,
         repo: event.repo.name,
-        issue_number: event.pr.number,
-        body,
+        pull_number: event.pr.number,
       });
-      console.log(`[tester] posted failure analysis on PR #${event.pr.number}`);
+
+      const { data: checks } = await octokit.request('GET /repos/{owner}/{repo}/commits/{ref}/check-runs', {
+        owner: event.repo.owner,
+        repo: event.repo.name,
+        ref: pr.head.sha,
+        per_page: 100,
+      });
+
+      const failed = checks.check_runs.filter((c) => c.conclusion === 'failure');
+      console.log(`[tester] ${failed.length}/${checks.total_count} checks failing on ${pr.head.sha.slice(0, 7)}`);
+
+      if (failed.length === 0) {
+        await postComment(octokit, event.repo, event.pr.number,
+          `## 🧪 Test failure analysis\n\nNo failing checks on the latest commit (\`${pr.head.sha.slice(0, 7)}\`) — everything's green. ✅`);
+        return;
+      }
+
+      // Fan out: one event per failing check → the per-check handler below runs
+      // them concurrently (the bus dispatches via Promise.all).
+      await Promise.all(failed.map((c) => bus.publish({
+        type: 'tests.check_run_completed',
+        repo: event.repo,
+        pr: event.pr,
+        checkRunId: c.id,
+        checkRunName: c.name,
+        conclusion: 'failure',
+        detailsUrl: c.details_url ?? '',
+        installationId: event.installationId,
+      })));
     } catch (err) {
-      console.error(`[tester] failed to post comment on PR #${event.pr.number}:`, err);
+      console.error(`[tester] on-demand analysis failed for PR #${event.pr.number}:`, err);
     }
   });
 }

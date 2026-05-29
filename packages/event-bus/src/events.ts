@@ -65,6 +65,15 @@ export interface CheckRunCompletedEvent {
   installationId: number;
 }
 
+/** On-demand request (e.g. from a PR comment) to analyze the PR's current failing checks. */
+export interface TestAnalysisRequestedEvent {
+  type: 'tests.analysis_requested';
+  repo: Repository;
+  pr: PullRequest;
+  requestedBy: string;
+  installationId: number;
+}
+
 // Butler
 export interface PrMentionEvent {
   type: 'pr.mention';
@@ -110,6 +119,7 @@ export type BlinEvent =
   | AnalystQuestionAskedEvent
   | TestsRunRequestedEvent
   | CheckRunCompletedEvent
+  | TestAnalysisRequestedEvent
   | ReleaseRequestedEvent
   | EnvironmentRequestedEvent
   | PrMentionEvent

@@ -1,9 +1,9 @@
-import type { IEventBus, PrMentionEvent, ReviewRequestedEvent, AnalystQuestionAskedEvent, ReviewThreadReplyEvent } from '@blin/event-bus';
+import type { IEventBus, PrMentionEvent, ReviewRequestedEvent, AnalystQuestionAskedEvent, ReviewThreadReplyEvent, TestAnalysisRequestedEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
 
 const BEDROCK_MODEL = 'us.anthropic.claude-sonnet-4-6';
 
-async function classifyIntent(comment: string): Promise<'review' | 'question' | 'unknown'> {
+async function classifyIntent(comment: string): Promise<'review' | 'question' | 'tests' | 'unknown'> {
   const region = process.env.AWS_REGION ?? 'us-east-1';
   const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
   const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL)}/converse`;
@@ -19,6 +19,7 @@ async function classifyIntent(comment: string): Promise<'review' | 'question' | 
 Reply with exactly one word:
 - "review" — user wants a code review of the PR
 - "question" — user is asking a question about the code, the PR, or how something works
+- "tests" — user wants to know why the CI tests/checks are failing or wants the failing tests analyzed
 - "unknown" — anything else` }],
       messages: [{ role: 'user', content: [{ text: comment }] }],
     }),
@@ -35,6 +36,7 @@ Reply with exactly one word:
 
   if (text.startsWith('review')) return 'review';
   if (text.startsWith('question')) return 'question';
+  if (text.startsWith('tests')) return 'tests';
   return 'unknown';
 }
 
@@ -105,6 +107,18 @@ export function register(bus: IEventBus, githubApp: App): void {
         installationId: event.installationId,
       };
       await bus.publish(reviewEvent);
+      return;
+    }
+
+    if (intent === 'tests') {
+      const testsEvent: TestAnalysisRequestedEvent = {
+        type: 'tests.analysis_requested',
+        repo: event.repo,
+        pr: event.pr,
+        requestedBy: event.author,
+        installationId: event.installationId,
+      };
+      await bus.publish(testsEvent);
       return;
     }
 
