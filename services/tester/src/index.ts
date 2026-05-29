@@ -99,20 +99,28 @@ function parseConsoleErrors(html: string): TestFailure[] {
   return failures;
 }
 
-/** Split the model's "VERDICT: …\n---\n<details>" response into its two parts. */
+/**
+ * Split the model's "VERDICT: …\n---\n<details>" response into its two parts.
+ * The agent often narrates its reasoning before the VERDICT line — anchor on
+ * the VERDICT marker and discard everything before it, so only the one-line
+ * verdict stays visible and the rest goes under the collapsed details.
+ */
 function splitVerdict(raw: string): { verdict: string; details: string } {
-  const sep = raw.match(/\n\s*-{3,}\s*\n/);
+  // Drop any preamble before the VERDICT marker (line-anchored, allows leading ** bold).
+  const anchor = raw.match(/(?:^|\n)\s*\**\s*verdict\s*\**\s*:?/i);
+  const body = anchor ? raw.slice(anchor.index! + anchor[0].length) : raw;
+
+  const sep = body.match(/\n\s*-{3,}\s*\n/);
   let verdict: string;
   let details: string;
   if (sep) {
-    verdict = raw.slice(0, sep.index).trim();
-    details = raw.slice(sep.index! + sep[0].length).trim();
+    verdict = body.slice(0, sep.index).trim();
+    details = body.slice(sep.index! + sep[0].length).trim();
   } else {
-    const nl = raw.indexOf('\n');
-    verdict = (nl < 0 ? raw : raw.slice(0, nl)).trim();
-    details = nl < 0 ? '' : raw.slice(nl + 1).trim();
+    const nl = body.indexOf('\n');
+    verdict = (nl < 0 ? body : body.slice(0, nl)).trim();
+    details = nl < 0 ? '' : body.slice(nl + 1).trim();
   }
-  verdict = verdict.replace(/^\**\s*verdict:?\s*\**\s*/i, '').trim();
   return { verdict, details };
 }
 
@@ -136,13 +144,15 @@ Critical guidance:
 
 You may be given several DISTINCT failures from one check. Judge each on its own merits.
 
-When done investigating, respond in EXACTLY this format (nothing before "VERDICT:"):
+When done investigating, respond in EXACTLY this format. Your message MUST begin with "VERDICT:" — no preamble, do NOT restate your investigation before it.
 
 VERDICT: <one short sentence summarizing across ALL failures — how many distinct failures, and the split between code problems and test problems, e.g. "3 distinct failures: 2 code problems, 1 test problem">
 ---
-<For EACH distinct failure, one Markdown section:>
+<For EACH distinct failure, one Markdown section in this exact shape:>
 ### <test name(s)> — <Code problem | Test problem>
-<the core error with file:line, what you found in the code, and a concrete fix / next step. If it's a code problem, point at the specific code — do NOT suggest editing the test.>
+**Error:** <the key error message with file:line>
+**Reasoning:** <why it fails — what you found in the code and the diff>
+**Fix:** <concrete fix. If it's a code problem, point at the specific code — do NOT suggest editing the test.>
 
 Be direct and brief. Cite the file:line you actually read. No filler.`;
 
@@ -184,6 +194,7 @@ async function analyzeAndPost(
   ref: string,
   prNumber: number,
   checkRunName: string,
+  checkUrl: string,
   output: { summary?: string | null; text?: string | null },
 ): Promise<boolean> {
   const logUrl = findConsoleLogUrl(output.summary ?? '');
@@ -248,15 +259,16 @@ async function analyzeAndPost(
   const { verdict, details } = splitVerdict(raw);
   if (!verdict) return false;
 
-  // Header + verdict stay visible; the per-failure breakdown and fixes go under
-  // a collapsed <details> so long reports don't clutter the PR.
+  // Header + verdict stay visible; the per-failure breakdown (error → reasoning
+  // → fix) and the link to the check go under a collapsed <details> so long
+  // reports don't clutter the PR.
   const countLabel = groups.length > 1 ? ` · ${groups.length} distinct failures` : '';
   const omittedNote = omitted > 0 ? `\n\n_…and ${omitted} more distinct failure(s) not shown._` : '';
+  const checkLink = checkUrl ? `\n\n**Check:** [${checkRunName}](${checkUrl})` : '';
+  const detailsBody = `${details || '(no breakdown produced)'}${omittedNote}${checkLink}`;
   const body =
-    `🧪 **Test failure — ${checkRunName}**${countLabel}\n\n${verdict}` +
-    (details
-      ? `\n\n<details>\n<summary>Details &amp; suggested fix</summary>\n\n${details}${omittedNote}\n\n</details>`
-      : omittedNote);
+    `🧪 **Test failure — ${checkRunName}**${countLabel}\n\n${verdict}\n\n` +
+    `<details>\n<summary>Details &amp; suggested fix</summary>\n\n${detailsBody}\n\n</details>`;
   await postComment(repo, prNumber, body);
   console.log(`[tester] posted failure analysis for "${checkRunName}" on PR #${prNumber}`);
   return true;
@@ -278,7 +290,7 @@ export function register(bus: IEventBus, githubApp: App): void {
         repo: event.repo.name,
         check_run_id: event.checkRunId,
       });
-      await analyzeAndPost(octokit, event.repo, data.head_sha, event.pr.number, event.checkRunName, data.output);
+      await analyzeAndPost(octokit, event.repo, data.head_sha, event.pr.number, event.checkRunName, data.html_url ?? event.detailsUrl, data.output);
     } catch (err) {
       console.error(`[tester] failed to handle check run ${event.checkRunId}:`, err);
     }

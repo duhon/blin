@@ -5273,18 +5273,19 @@ function parseConsoleErrors(html) {
   return failures;
 }
 function splitVerdict(raw) {
-  const sep2 = raw.match(/\n\s*-{3,}\s*\n/);
+  const anchor = raw.match(/(?:^|\n)\s*\**\s*verdict\s*\**\s*:?/i);
+  const body = anchor ? raw.slice(anchor.index + anchor[0].length) : raw;
+  const sep2 = body.match(/\n\s*-{3,}\s*\n/);
   let verdict;
   let details;
   if (sep2) {
-    verdict = raw.slice(0, sep2.index).trim();
-    details = raw.slice(sep2.index + sep2[0].length).trim();
+    verdict = body.slice(0, sep2.index).trim();
+    details = body.slice(sep2.index + sep2[0].length).trim();
   } else {
-    const nl = raw.indexOf("\n");
-    verdict = (nl < 0 ? raw : raw.slice(0, nl)).trim();
-    details = nl < 0 ? "" : raw.slice(nl + 1).trim();
+    const nl = body.indexOf("\n");
+    verdict = (nl < 0 ? body : body.slice(0, nl)).trim();
+    details = nl < 0 ? "" : body.slice(nl + 1).trim();
   }
-  verdict = verdict.replace(/^\**\s*verdict:?\s*\**\s*/i, "").trim();
   return { verdict, details };
 }
 var SYSTEM_PROMPT2 = `You are a senior PHP engineer triaging failed CI tests on a GitHub pull request for Magento.
@@ -5307,13 +5308,15 @@ Critical guidance:
 
 You may be given several DISTINCT failures from one check. Judge each on its own merits.
 
-When done investigating, respond in EXACTLY this format (nothing before "VERDICT:"):
+When done investigating, respond in EXACTLY this format. Your message MUST begin with "VERDICT:" \u2014 no preamble, do NOT restate your investigation before it.
 
 VERDICT: <one short sentence summarizing across ALL failures \u2014 how many distinct failures, and the split between code problems and test problems, e.g. "3 distinct failures: 2 code problems, 1 test problem">
 ---
-<For EACH distinct failure, one Markdown section:>
+<For EACH distinct failure, one Markdown section in this exact shape:>
 ### <test name(s)> \u2014 <Code problem | Test problem>
-<the core error with file:line, what you found in the code, and a concrete fix / next step. If it's a code problem, point at the specific code \u2014 do NOT suggest editing the test.>
+**Error:** <the key error message with file:line>
+**Reasoning:** <why it fails \u2014 what you found in the code and the diff>
+**Fix:** <concrete fix. If it's a code problem, point at the specific code \u2014 do NOT suggest editing the test.>
 
 Be direct and brief. Cite the file:line you actually read. No filler.`;
 async function postComment(repo, prNumber, body) {
@@ -5331,7 +5334,7 @@ async function postComment(repo, prNumber, body) {
     console.error(`[tester] failed to post comment on PR #${prNumber} (${res.status}): ${await res.text()}`);
   }
 }
-async function analyzeAndPost(octokit, repo, ref, prNumber, checkRunName, output) {
+async function analyzeAndPost(octokit, repo, ref, prNumber, checkRunName, checkUrl, output) {
   const logUrl = findConsoleLogUrl(output.summary ?? "");
   if (!logUrl) {
     console.log(`[tester] no console-error-logs link in "${checkRunName}", skipping (non-PHPUnit check)`);
@@ -5396,16 +5399,20 @@ Investigate with get_pr_description / read_file / get_pr_diff, then give your ve
   const omittedNote = omitted > 0 ? `
 
 _\u2026and ${omitted} more distinct failure(s) not shown._` : "";
+  const checkLink = checkUrl ? `
+
+**Check:** [${checkRunName}](${checkUrl})` : "";
+  const detailsBody = `${details || "(no breakdown produced)"}${omittedNote}${checkLink}`;
   const body = `\u{1F9EA} **Test failure \u2014 ${checkRunName}**${countLabel}
 
-${verdict}` + (details ? `
+${verdict}
 
 <details>
 <summary>Details &amp; suggested fix</summary>
 
-${details}${omittedNote}
+${detailsBody}
 
-</details>` : omittedNote);
+</details>`;
   await postComment(repo, prNumber, body);
   console.log(`[tester] posted failure analysis for "${checkRunName}" on PR #${prNumber}`);
   return true;
@@ -5424,7 +5431,7 @@ function register5(bus, githubApp) {
         repo: event.repo.name,
         check_run_id: event.checkRunId
       });
-      await analyzeAndPost(octokit, event.repo, data.head_sha, event.pr.number, event.checkRunName, data.output);
+      await analyzeAndPost(octokit, event.repo, data.head_sha, event.pr.number, event.checkRunName, data.html_url ?? event.detailsUrl, data.output);
     } catch (err) {
       console.error(`[tester] failed to handle check run ${event.checkRunId}:`, err);
     }
