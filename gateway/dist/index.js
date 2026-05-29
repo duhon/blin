@@ -5074,6 +5074,18 @@ function register4(bus, githubApp) {
 
 // ../services/tester/dist/index.js
 var BEDROCK_MODEL3 = "us.anthropic.claude-sonnet-4-6";
+var MAX_FAILURES = 10;
+function dedupeFailures(failures) {
+  const map = /* @__PURE__ */ new Map();
+  for (const f of failures) {
+    const g = map.get(f.error);
+    if (g)
+      g.names.push(f.name);
+    else
+      map.set(f.error, { names: [f.name], error: f.error });
+  }
+  return [...map.values()];
+}
 function findConsoleLogUrl(summary) {
   const match = summary.match(/\((https?:\/\/[^)]*console-error-logs\.html)\)/i);
   return match ? match[1] : null;
@@ -5121,28 +5133,44 @@ Critical guidance:
 - Only propose a test fix when the failure is genuinely a test-side issue (e.g. an obviously wrong assertion, a missing/misconfigured @dataProvider, environment assumptions).
 - Take the Build configuration into account (PHP version, Magento version, editions, dependency versions). A failure may be specific to a PHP/Magento version \u2014 say so when relevant.
 
-Write a concise PR comment in GitHub Markdown:
-- State which test(s) failed and the core error (with file:line if present).
-- Give your verdict: is this a code problem or a test problem, and why.
-- Recommend a concrete next step / fix. If it's a code problem, point at the likely code area \u2014 do not suggest editing the test.
+You may be given several DISTINCT failures from one check. Judge each on its own merits.
+
+Respond in EXACTLY this format (nothing before "VERDICT:"):
+
+VERDICT: <one short sentence summarizing across ALL failures \u2014 how many distinct failures, and the split between code problems and test problems, e.g. "3 distinct failures: 2 code problems, 1 test problem">
+---
+<For EACH distinct failure, one Markdown section:>
+### <test name(s)> \u2014 <Code problem | Test problem>
+<the core error with file:line, why it fails, and a concrete fix / next step. If it's a code problem, point at the likely code area \u2014 do NOT suggest editing the test.>
+
 Be direct and brief. No filler.`;
-async function analyzeFailures(buildConfig, failures) {
+function splitVerdict(raw) {
+  const sep2 = raw.match(/\n\s*-{3,}\s*\n/);
+  let verdict;
+  let details;
+  if (sep2) {
+    verdict = raw.slice(0, sep2.index).trim();
+    details = raw.slice(sep2.index + sep2[0].length).trim();
+  } else {
+    const nl = raw.indexOf("\n");
+    verdict = (nl < 0 ? raw : raw.slice(0, nl)).trim();
+    details = nl < 0 ? "" : raw.slice(nl + 1).trim();
+  }
+  verdict = verdict.replace(/^\**\s*verdict:?\s*\**\s*/i, "").trim();
+  return { verdict, details };
+}
+async function analyzeFailures(buildConfig, groups) {
   const region = process.env.AWS_REGION ?? "us-east-1";
   const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
   const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL3)}/converse`;
-  const unique = /* @__PURE__ */ new Map();
-  for (const f of failures) {
-    const key = f.error;
-    (unique.get(key) ?? unique.set(key, []).get(key)).push(f);
-  }
-  const failureText = [...unique.entries()].map(([, group]) => `Failed in: ${group.map((g) => g.name).join(", ")}
+  const failureText = groups.map((g, i) => `### Failure ${i + 1} \u2014 failed in: ${g.names.join(", ")}
 
-${group[0].error}`).join("\n\n---\n\n");
+${g.error}`).join("\n\n");
   const userText = `${buildConfig ? `${buildConfig}
 
 ---
 
-` : ""}Failed tests:
+` : ""}Failed tests (${groups.length} distinct):
 
 ${failureText}`;
   const response = await fetch(url, {
@@ -5160,7 +5188,7 @@ ${failureText}`;
     throw new Error(`Bedrock error: ${response.status} ${await response.text()}`);
   }
   const data = await response.json();
-  return data.output?.message?.content?.[0]?.text?.trim() ?? "";
+  return splitVerdict(data.output?.message?.content?.[0]?.text?.trim() ?? "");
 }
 async function postComment(octokit, repo, prNumber, body) {
   await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
@@ -5194,19 +5222,35 @@ async function analyzeAndPost(octokit, repo, prNumber, checkRunName, output) {
     console.log(`[tester] no failing tests parsed from "${checkRunName}", skipping`);
     return false;
   }
-  console.log(`[tester] parsed ${failures.length} failing test run(s) from "${checkRunName}"`);
-  let analysis;
+  const groups = dedupeFailures(failures);
+  const shown = groups.slice(0, MAX_FAILURES);
+  const omitted = groups.length - shown.length;
+  console.log(`[tester] "${checkRunName}": ${failures.length} runs \u2192 ${groups.length} distinct failure(s)${omitted > 0 ? `, analyzing first ${MAX_FAILURES}` : ""}`);
+  let verdict;
+  let details;
   try {
-    analysis = await analyzeFailures(extractBuildConfig(output.text ?? ""), failures);
+    ({ verdict, details } = await analyzeFailures(extractBuildConfig(output.text ?? ""), shown));
   } catch (err) {
     console.error(`[tester] analysis failed for "${checkRunName}":`, err);
     return false;
   }
-  if (!analysis)
+  if (!verdict)
     return false;
-  await postComment(octokit, repo, prNumber, `## \u{1F9EA} Test failure analysis \u2014 ${checkRunName}
+  const countLabel = groups.length > 1 ? ` \xB7 ${groups.length} distinct failures` : "";
+  const omittedNote = omitted > 0 ? `
 
-${analysis}`);
+_\u2026and ${omitted} more distinct failure(s) not shown._` : "";
+  const body = `\u{1F9EA} **Test failure \u2014 ${checkRunName}**${countLabel}
+
+${verdict}` + (details ? `
+
+<details>
+<summary>Details &amp; suggested fix</summary>
+
+${details}${omittedNote}
+
+</details>` : omittedNote);
+  await postComment(octokit, repo, prNumber, body);
   console.log(`[tester] posted failure analysis for "${checkRunName}" on PR #${prNumber}`);
   return true;
 }

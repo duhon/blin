@@ -10,6 +10,26 @@ interface TestFailure {
   error: string;
 }
 
+/** One distinct failure (a unique error) and every run/edition it occurred in. */
+interface FailureGroup {
+  names: string[];
+  error: string;
+}
+
+/** Cap how many distinct failures we feed the model / render, to bound tokens and comment size. */
+const MAX_FAILURES = 10;
+
+/** Collapse identical errors (the same test failing on B2B/CE/EE is one distinct failure). */
+function dedupeFailures(failures: TestFailure[]): FailureGroup[] {
+  const map = new Map<string, FailureGroup>();
+  for (const f of failures) {
+    const g = map.get(f.error);
+    if (g) g.names.push(f.name);
+    else map.set(f.error, { names: [f.name], error: f.error });
+  }
+  return [...map.values()];
+}
+
 /**
  * The GitHub Check Run carries no logs — `output.summary` is a list of markdown
  * links to external report files. The PHPUnit/console output is the link whose
@@ -90,28 +110,45 @@ Critical guidance:
 - Only propose a test fix when the failure is genuinely a test-side issue (e.g. an obviously wrong assertion, a missing/misconfigured @dataProvider, environment assumptions).
 - Take the Build configuration into account (PHP version, Magento version, editions, dependency versions). A failure may be specific to a PHP/Magento version — say so when relevant.
 
-Write a concise PR comment in GitHub Markdown:
-- State which test(s) failed and the core error (with file:line if present).
-- Give your verdict: is this a code problem or a test problem, and why.
-- Recommend a concrete next step / fix. If it's a code problem, point at the likely code area — do not suggest editing the test.
+You may be given several DISTINCT failures from one check. Judge each on its own merits.
+
+Respond in EXACTLY this format (nothing before "VERDICT:"):
+
+VERDICT: <one short sentence summarizing across ALL failures — how many distinct failures, and the split between code problems and test problems, e.g. "3 distinct failures: 2 code problems, 1 test problem">
+---
+<For EACH distinct failure, one Markdown section:>
+### <test name(s)> — <Code problem | Test problem>
+<the core error with file:line, why it fails, and a concrete fix / next step. If it's a code problem, point at the likely code area — do NOT suggest editing the test.>
+
 Be direct and brief. No filler.`;
 
-async function analyzeFailures(buildConfig: string, failures: TestFailure[]): Promise<string> {
+/** Split the model's "VERDICT: …\n---\n<details>" response into its two parts. */
+function splitVerdict(raw: string): { verdict: string; details: string } {
+  const sep = raw.match(/\n\s*-{3,}\s*\n/);
+  let verdict: string;
+  let details: string;
+  if (sep) {
+    verdict = raw.slice(0, sep.index).trim();
+    details = raw.slice(sep.index! + sep[0].length).trim();
+  } else {
+    const nl = raw.indexOf('\n');
+    verdict = (nl < 0 ? raw : raw.slice(0, nl)).trim();
+    details = nl < 0 ? '' : raw.slice(nl + 1).trim();
+  }
+  verdict = verdict.replace(/^\**\s*verdict:?\s*\**\s*/i, '').trim();
+  return { verdict, details };
+}
+
+async function analyzeFailures(buildConfig: string, groups: FailureGroup[]): Promise<{ verdict: string; details: string }> {
   const region = process.env.AWS_REGION ?? 'us-east-1';
   const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
   const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL)}/converse`;
 
-  // Collapse identical errors across runs (same test often fails on every edition).
-  const unique = new Map<string, TestFailure[]>();
-  for (const f of failures) {
-    const key = f.error;
-    (unique.get(key) ?? unique.set(key, []).get(key)!).push(f);
-  }
-  const failureText = [...unique.entries()]
-    .map(([, group]) => `Failed in: ${group.map((g) => g.name).join(', ')}\n\n${group[0].error}`)
-    .join('\n\n---\n\n');
+  const failureText = groups
+    .map((g, i) => `### Failure ${i + 1} — failed in: ${g.names.join(', ')}\n\n${g.error}`)
+    .join('\n\n');
 
-  const userText = `${buildConfig ? `${buildConfig}\n\n---\n\n` : ''}Failed tests:\n\n${failureText}`;
+  const userText = `${buildConfig ? `${buildConfig}\n\n---\n\n` : ''}Failed tests (${groups.length} distinct):\n\n${failureText}`;
 
   const response = await fetch(url, {
     method: 'POST',
@@ -130,7 +167,7 @@ async function analyzeFailures(buildConfig: string, failures: TestFailure[]): Pr
   }
 
   const data = await response.json() as any;
-  return data.output?.message?.content?.[0]?.text?.trim() ?? '';
+  return splitVerdict(data.output?.message?.content?.[0]?.text?.trim() ?? '');
 }
 
 async function postComment(
@@ -183,18 +220,33 @@ async function analyzeAndPost(
     console.log(`[tester] no failing tests parsed from "${checkRunName}", skipping`);
     return false;
   }
-  console.log(`[tester] parsed ${failures.length} failing test run(s) from "${checkRunName}"`);
 
-  let analysis: string;
+  // Collapse identical errors, then cap the distinct failures we analyze/render.
+  const groups = dedupeFailures(failures);
+  const shown = groups.slice(0, MAX_FAILURES);
+  const omitted = groups.length - shown.length;
+  console.log(`[tester] "${checkRunName}": ${failures.length} runs → ${groups.length} distinct failure(s)${omitted > 0 ? `, analyzing first ${MAX_FAILURES}` : ''}`);
+
+  let verdict: string;
+  let details: string;
   try {
-    analysis = await analyzeFailures(extractBuildConfig(output.text ?? ''), failures);
+    ({ verdict, details } = await analyzeFailures(extractBuildConfig(output.text ?? ''), shown));
   } catch (err) {
     console.error(`[tester] analysis failed for "${checkRunName}":`, err);
     return false;
   }
-  if (!analysis) return false;
+  if (!verdict) return false;
 
-  await postComment(octokit, repo, prNumber, `## 🧪 Test failure analysis — ${checkRunName}\n\n${analysis}`);
+  // Header + verdict stay visible; the per-failure breakdown and fixes go under
+  // a collapsed <details> so long reports don't clutter the PR.
+  const countLabel = groups.length > 1 ? ` · ${groups.length} distinct failures` : '';
+  const omittedNote = omitted > 0 ? `\n\n_…and ${omitted} more distinct failure(s) not shown._` : '';
+  const body =
+    `🧪 **Test failure — ${checkRunName}**${countLabel}\n\n${verdict}` +
+    (details
+      ? `\n\n<details>\n<summary>Details &amp; suggested fix</summary>\n\n${details}${omittedNote}\n\n</details>`
+      : omittedNote);
+  await postComment(octokit, repo, prNumber, body);
   console.log(`[tester] posted failure analysis for "${checkRunName}" on PR #${prNumber}`);
   return true;
 }
