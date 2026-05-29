@@ -4211,6 +4211,146 @@ function register2(bus, githubApp) {
 // ../services/reviewer/dist/index.js
 var import_client_s3 = require("@aws-sdk/client-s3");
 
+// ../packages/github-tools/dist/index.js
+var DEFAULT_READ_LIMIT = 200;
+var MAX_READ_LIMIT = 800;
+var MAX_DIFF_CHARS = 12e3;
+function getPrDescriptionTool(ctx) {
+  return {
+    name: "get_pr_description",
+    description: "The pull request's title and description \u2014 the author's intent: what changed and the problem being solved. The title often carries the intent when the description is thin.",
+    inputSchema: { type: "object", properties: {} },
+    async run() {
+      try {
+        const { data: pr } = await ctx.octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
+          owner: ctx.owner,
+          repo: ctx.repo,
+          pull_number: ctx.prNumber
+        });
+        return JSON.stringify({
+          title: pr.title,
+          description: (pr.body ?? "").trim() || "(no description provided)",
+          base: pr.base?.ref,
+          head: pr.head?.ref
+        });
+      } catch (e) {
+        return `Could not fetch PR description: ${e?.status ?? e?.message ?? e}`;
+      }
+    }
+  };
+}
+function getPrDiffTool(ctx) {
+  return {
+    name: "get_pr_diff",
+    description: "Get the unified diff of the PR to see what changed and the real file paths in this repo.",
+    inputSchema: { type: "object", properties: {} },
+    async run() {
+      try {
+        const resp = await ctx.octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
+          owner: ctx.owner,
+          repo: ctx.repo,
+          pull_number: ctx.prNumber,
+          mediaType: { format: "diff" }
+        });
+        const diff = String(resp.data ?? "");
+        if (!diff)
+          return "(empty diff)";
+        return diff.length > MAX_DIFF_CHARS ? `${diff.slice(0, MAX_DIFF_CHARS)}
+\u2026(diff truncated)` : diff;
+      } catch (e) {
+        return `Could not fetch PR diff: ${e?.status ?? e?.message ?? e}`;
+      }
+    }
+  };
+}
+function listPrFilesTool(ctx) {
+  return {
+    name: "list_pr_files",
+    description: "List all files changed in this PR with their status (added/modified/removed) and change counts.",
+    inputSchema: { type: "object", properties: {} },
+    async run() {
+      try {
+        const { data } = await ctx.octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}/files", {
+          owner: ctx.owner,
+          repo: ctx.repo,
+          pull_number: ctx.prNumber,
+          per_page: 100
+        });
+        return data.map((f) => `${f.status}	+${f.additions} -${f.deletions}	${f.filename}`).join("\n") || "(no files)";
+      } catch (e) {
+        return `Could not list PR files: ${e?.status ?? e?.message ?? e}`;
+      }
+    }
+  };
+}
+function getPrCommitsTool(ctx) {
+  return {
+    name: "get_pr_commits",
+    description: "The PR's commit messages \u2014 often the clearest statement of intent when the description is thin or empty.",
+    inputSchema: { type: "object", properties: {} },
+    async run() {
+      try {
+        const { data } = await ctx.octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}/commits", {
+          owner: ctx.owner,
+          repo: ctx.repo,
+          pull_number: ctx.prNumber,
+          per_page: 100
+        });
+        return data.map((c) => `- ${c.commit.message.split("\n")[0]}`).join("\n") || "(no commits)";
+      } catch (e) {
+        return `Could not fetch PR commits: ${e?.status ?? e?.message ?? e}`;
+      }
+    }
+  };
+}
+function readFileTool(ctx, opts = {}) {
+  const defaultLimit = opts.defaultLimit ?? DEFAULT_READ_LIMIT;
+  const maxLimit = opts.maxLimit ?? MAX_READ_LIMIT;
+  return {
+    name: "read_file",
+    description: `Read a slice of a file at the PR head revision, returned with line numbers. Paginate with offset+limit (default ${defaultLimit}, max ${maxLimit}).`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Repo-relative file path." },
+        offset: { type: "number", description: "1-based start line. Default 1." },
+        limit: { type: "number", description: `Max lines to return. Default ${defaultLimit}, max ${maxLimit}.` }
+      },
+      required: ["path"]
+    },
+    async run(input) {
+      let path = String(input.path ?? "").trim();
+      if (opts.stripPrefix)
+        path = path.replace(opts.stripPrefix, "");
+      path = path.replace(/^\/+/, "");
+      if (!path)
+        return "Provide a non-empty path.";
+      const offset = Math.max(1, Number(input.offset) || 1);
+      const limit = Math.min(Number(input.limit) || defaultLimit, maxLimit);
+      try {
+        const { data } = await ctx.octokit.request("GET /repos/{owner}/{repo}/contents/{path}", {
+          owner: ctx.owner,
+          repo: ctx.repo,
+          path,
+          ref: ctx.ref
+        });
+        if (Array.isArray(data) || data.type !== "file" || !data.content) {
+          return `'${path}' is not a readable file (maybe a directory).`;
+        }
+        const content = Buffer.from(data.content, "base64").toString("utf8");
+        const lines = content.split("\n");
+        const out = lines.slice(offset - 1, offset - 1 + limit).map((l, i) => `${offset + i}	${l}`).join("\n");
+        const footer = `
+
+(file has ${lines.length} lines; showed ${offset}\u2013${Math.min(offset + limit - 1, lines.length)})`;
+        return (out || "(no lines in that range)") + footer;
+      } catch (e) {
+        return `Could not read '${path}' at ${ctx.ref.slice(0, 7)}: ${e?.status ?? e?.message ?? e}. Use get_pr_diff to discover the real file paths in this repo.`;
+      }
+    }
+  };
+}
+
 // ../services/reviewer/dist/knowledge/basic.js
 var basic_default = `
 # Basic Code Review Knowledge
@@ -4406,8 +4546,8 @@ var knowledgePacks = {
 var s3 = new import_client_s3.S3Client({});
 var MEMORY_BUCKET = process.env.BLIN_MEMORY_BUCKET;
 var MAX_ITERATIONS = 20;
-var DEFAULT_READ_LIMIT = 200;
-var MAX_READ_LIMIT = 1e3;
+var DEFAULT_READ_LIMIT2 = 200;
+var MAX_READ_LIMIT2 = 1e3;
 var DEFAULT_CONFIG = {
   knowledge: ["basic"],
   context_files: []
@@ -4595,22 +4735,8 @@ Recurring risky patterns specific to this codebase that are worth flagging when 
   },
   {
     toolSpec: {
-      name: "get_pr_description",
-      description: "Get the PR title, description, and base/head branch info",
-      inputSchema: { json: { type: "object", properties: {} } }
-    }
-  },
-  {
-    toolSpec: {
       name: "get_pr_diff",
       description: "Get the full diff of the pull request",
-      inputSchema: { json: { type: "object", properties: {} } }
-    }
-  },
-  {
-    toolSpec: {
-      name: "list_pr_files",
-      description: "List all files changed in this PR with their status (added/modified/deleted)",
       inputSchema: { json: { type: "object", properties: {} } }
     }
   },
@@ -4624,7 +4750,7 @@ Recurring risky patterns specific to this codebase that are worth flagging when 
           properties: {
             path: { type: "string", description: "File path relative to repo root" },
             offset: { type: "number", description: `1-based line to start from. Default 1.` },
-            limit: { type: "number", description: `Max lines to return. Default ${DEFAULT_READ_LIMIT}, max ${MAX_READ_LIMIT}.` }
+            limit: { type: "number", description: `Max lines to return. Default ${DEFAULT_READ_LIMIT2}, max ${MAX_READ_LIMIT2}.` }
           },
           required: ["path"]
         }
@@ -4666,6 +4792,7 @@ var SYSTEM_PROMPT = `You are a senior engineer doing a thorough code review of a
 
 You have tools to explore the PR and post inline comments:
 - get_pr_description: understand the purpose of the PR
+- get_pr_commits: the PR's commit messages \u2014 extra intent when the description is thin
 - get_pr_diff: see what changed
 - list_pr_files: see all changed files
 - read_file: read a slice of any file in the repo for full context. Paginate with offset+limit when the footer says more lines exist \u2014 do NOT re-read the same file/range expecting different output
@@ -4674,7 +4801,7 @@ You have tools to explore the PR and post inline comments:
 
 Your review process:
 1. get_project_conventions \u2014 always start here; includes memory from previous reviews of this repo
-2. get_pr_description \u2014 understand the purpose of the PR
+2. get_pr_description \u2014 understand the purpose of the PR (get_pr_commits if the description is thin)
 3. get_pr_diff \u2014 see what changed
 4. read_file as needed \u2014 get context from related files, types, interfaces
 5. create_inline_comment \u2014 post comments for real issues found
@@ -4799,31 +4926,9 @@ ${memory}`);
       }
       return sections.length > 0 ? sections.join("\n\n") : "No project conventions configured. Apply general best practices.";
     }
-    case "get_pr_description": {
-      return JSON.stringify({
-        title: ctx.pr.title,
-        body: ctx.pr.body ?? "(no description)",
-        base: ctx.pr.base,
-        head: ctx.pr.head
-      });
-    }
     case "get_pr_diff": {
       const { annotated } = await loadDiffMap(ctx);
       return annotated;
-    }
-    case "list_pr_files": {
-      const { data } = await ctx.octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}/files", {
-        owner: ctx.owner,
-        repo: ctx.repo,
-        pull_number: ctx.pullNumber,
-        per_page: 100
-      });
-      return JSON.stringify(data.map((f) => ({
-        path: f.filename,
-        status: f.status,
-        additions: f.additions,
-        deletions: f.deletions
-      })));
     }
     case "read_file": {
       try {
@@ -4837,7 +4942,7 @@ ${memory}`);
         const allLines = content.split("\n");
         const totalLines = allLines.length;
         const offset = Math.max(1, Math.floor(input.offset ?? 1));
-        const limit = Math.min(MAX_READ_LIMIT, Math.max(1, Math.floor(input.limit ?? DEFAULT_READ_LIMIT)));
+        const limit = Math.min(MAX_READ_LIMIT2, Math.max(1, Math.floor(input.limit ?? DEFAULT_READ_LIMIT2)));
         if (offset > totalLines) {
           return `File ${input.path} has ${totalLines} lines. offset=${offset} is past the end.`;
         }
@@ -4963,11 +5068,23 @@ function register3(bus, githubApp) {
     const userRequest = event.instructions ? `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}
 
 Specific request from ${event.requestedBy}: ${event.instructions}` : `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}`;
+    const toolCtx = {
+      octokit: ctx.octokit,
+      owner: ctx.owner,
+      repo: ctx.repo,
+      prNumber: ctx.pullNumber,
+      ref: ctx.headSha
+    };
     const agent = new BedrockAgent({ logPrefix: `[reviewer] PR #${event.pr.number}`, maxIterations: MAX_ITERATIONS });
     await agent.run({
       instructions: SYSTEM_PROMPT,
       request: userRequest,
-      tools: toAgentTools(TOOLS, (name, input) => executeTool(name, input, ctx))
+      tools: [
+        ...toAgentTools(TOOLS, (name, input) => executeTool(name, input, ctx)),
+        getPrDescriptionTool(toolCtx),
+        listPrFilesTool(toolCtx),
+        getPrCommitsTool(toolCtx)
+      ]
     });
     const reviewEvent = ctx.commentsPosted === 0 ? "APPROVE" : "REQUEST_CHANGES";
     const reviewBody = ctx.commentsPosted === 0 ? `Looks good to me \u{1F44D}` : `Found ${ctx.commentsPosted} critical issue${ctx.commentsPosted > 1 ? "s" : ""}. Please address the inline comments.`;
@@ -5008,7 +5125,7 @@ Be concise. If their argument is valid, acknowledge it and explain if you're ret
               properties: {
                 path: { type: "string", description: "File path relative to repo root" },
                 offset: { type: "number", description: "1-based line to start from. Default 1." },
-                limit: { type: "number", description: `Max lines to return. Default ${DEFAULT_READ_LIMIT}, max ${MAX_READ_LIMIT}.` }
+                limit: { type: "number", description: `Max lines to return. Default ${DEFAULT_READ_LIMIT2}, max ${MAX_READ_LIMIT2}.` }
               },
               required: ["path"]
             }
@@ -5104,106 +5221,6 @@ function register4(bus, githubApp) {
     console.log(`[analyst] question in PR #${event.pr.number} from ${event.askedBy}`);
     console.log(`[analyst] would create discussion for PR #${event.pr.number} (mock)`);
   });
-}
-
-// ../packages/github-tools/dist/index.js
-var DEFAULT_READ_LIMIT2 = 200;
-var MAX_READ_LIMIT2 = 800;
-var MAX_DIFF_CHARS = 12e3;
-function getPrDescriptionTool(ctx) {
-  return {
-    name: "get_pr_description",
-    description: "The pull request's title and description \u2014 the author's intent: what changed and the problem being solved. The title often carries the intent when the description is thin.",
-    inputSchema: { type: "object", properties: {} },
-    async run() {
-      try {
-        const { data: pr } = await ctx.octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
-          owner: ctx.owner,
-          repo: ctx.repo,
-          pull_number: ctx.prNumber
-        });
-        return JSON.stringify({
-          title: pr.title,
-          description: (pr.body ?? "").trim() || "(no description provided)",
-          base: pr.base?.ref,
-          head: pr.head?.ref
-        });
-      } catch (e) {
-        return `Could not fetch PR description: ${e?.status ?? e?.message ?? e}`;
-      }
-    }
-  };
-}
-function getPrDiffTool(ctx) {
-  return {
-    name: "get_pr_diff",
-    description: "Get the unified diff of the PR to see what changed and the real file paths in this repo.",
-    inputSchema: { type: "object", properties: {} },
-    async run() {
-      try {
-        const resp = await ctx.octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
-          owner: ctx.owner,
-          repo: ctx.repo,
-          pull_number: ctx.prNumber,
-          mediaType: { format: "diff" }
-        });
-        const diff = String(resp.data ?? "");
-        if (!diff)
-          return "(empty diff)";
-        return diff.length > MAX_DIFF_CHARS ? `${diff.slice(0, MAX_DIFF_CHARS)}
-\u2026(diff truncated)` : diff;
-      } catch (e) {
-        return `Could not fetch PR diff: ${e?.status ?? e?.message ?? e}`;
-      }
-    }
-  };
-}
-function readFileTool(ctx, opts = {}) {
-  const defaultLimit = opts.defaultLimit ?? DEFAULT_READ_LIMIT2;
-  const maxLimit = opts.maxLimit ?? MAX_READ_LIMIT2;
-  return {
-    name: "read_file",
-    description: `Read a slice of a file at the PR head revision, returned with line numbers. Paginate with offset+limit (default ${defaultLimit}, max ${maxLimit}).`,
-    inputSchema: {
-      type: "object",
-      properties: {
-        path: { type: "string", description: "Repo-relative file path." },
-        offset: { type: "number", description: "1-based start line. Default 1." },
-        limit: { type: "number", description: `Max lines to return. Default ${defaultLimit}, max ${maxLimit}.` }
-      },
-      required: ["path"]
-    },
-    async run(input) {
-      let path = String(input.path ?? "").trim();
-      if (opts.stripPrefix)
-        path = path.replace(opts.stripPrefix, "");
-      path = path.replace(/^\/+/, "");
-      if (!path)
-        return "Provide a non-empty path.";
-      const offset = Math.max(1, Number(input.offset) || 1);
-      const limit = Math.min(Number(input.limit) || defaultLimit, maxLimit);
-      try {
-        const { data } = await ctx.octokit.request("GET /repos/{owner}/{repo}/contents/{path}", {
-          owner: ctx.owner,
-          repo: ctx.repo,
-          path,
-          ref: ctx.ref
-        });
-        if (Array.isArray(data) || data.type !== "file" || !data.content) {
-          return `'${path}' is not a readable file (maybe a directory).`;
-        }
-        const content = Buffer.from(data.content, "base64").toString("utf8");
-        const lines = content.split("\n");
-        const out = lines.slice(offset - 1, offset - 1 + limit).map((l, i) => `${offset + i}	${l}`).join("\n");
-        const footer = `
-
-(file has ${lines.length} lines; showed ${offset}\u2013${Math.min(offset + limit - 1, lines.length)})`;
-        return (out || "(no lines in that range)") + footer;
-      } catch (e) {
-        return `Could not read '${path}' at ${ctx.ref.slice(0, 7)}: ${e?.status ?? e?.message ?? e}. Use get_pr_diff to discover the real file paths in this repo.`;
-      }
-    }
-  };
 }
 
 // ../services/tester/dist/index.js

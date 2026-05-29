@@ -2,6 +2,7 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3
 import type { IEventBus, ReviewRequestedEvent, ReviewThreadReplyEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
 import { BedrockAgent, type AgentTool } from '@blin/agent';
+import { getPrDescriptionTool, listPrFilesTool, getPrCommitsTool, type GitHubToolContext } from '@blin/github-tools';
 import { knowledgePacks } from './knowledge/index.js';
 
 const s3 = new S3Client({});
@@ -211,22 +212,8 @@ Recurring risky patterns specific to this codebase that are worth flagging when 
   },
   {
     toolSpec: {
-      name: 'get_pr_description',
-      description: 'Get the PR title, description, and base/head branch info',
-      inputSchema: { json: { type: 'object', properties: {} } },
-    },
-  },
-  {
-    toolSpec: {
       name: 'get_pr_diff',
       description: 'Get the full diff of the pull request',
-      inputSchema: { json: { type: 'object', properties: {} } },
-    },
-  },
-  {
-    toolSpec: {
-      name: 'list_pr_files',
-      description: 'List all files changed in this PR with their status (added/modified/deleted)',
       inputSchema: { json: { type: 'object', properties: {} } },
     },
   },
@@ -283,6 +270,7 @@ const SYSTEM_PROMPT = `You are a senior engineer doing a thorough code review of
 
 You have tools to explore the PR and post inline comments:
 - get_pr_description: understand the purpose of the PR
+- get_pr_commits: the PR's commit messages — extra intent when the description is thin
 - get_pr_diff: see what changed
 - list_pr_files: see all changed files
 - read_file: read a slice of any file in the repo for full context. Paginate with offset+limit when the footer says more lines exist — do NOT re-read the same file/range expecting different output
@@ -291,7 +279,7 @@ You have tools to explore the PR and post inline comments:
 
 Your review process:
 1. get_project_conventions — always start here; includes memory from previous reviews of this repo
-2. get_pr_description — understand the purpose of the PR
+2. get_pr_description — understand the purpose of the PR (get_pr_commits if the description is thin)
 3. get_pr_diff — see what changed
 4. read_file as needed — get context from related files, types, interfaces
 5. create_inline_comment — post comments for real issues found
@@ -428,33 +416,9 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
         : 'No project conventions configured. Apply general best practices.';
     }
 
-    case 'get_pr_description': {
-      return JSON.stringify({
-        title: ctx.pr.title,
-        body: ctx.pr.body ?? '(no description)',
-        base: ctx.pr.base,
-        head: ctx.pr.head,
-      });
-    }
-
     case 'get_pr_diff': {
       const { annotated } = await loadDiffMap(ctx);
       return annotated;
-    }
-
-    case 'list_pr_files': {
-      const { data } = await ctx.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/files', {
-        owner: ctx.owner,
-        repo: ctx.repo,
-        pull_number: ctx.pullNumber,
-        per_page: 100,
-      });
-      return JSON.stringify(data.map((f: any) => ({
-        path: f.filename,
-        status: f.status,
-        additions: f.additions,
-        deletions: f.deletions,
-      })));
     }
 
     case 'read_file': {
@@ -620,11 +584,27 @@ export function register(bus: IEventBus, githubApp: App): void {
       ? `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}\n\nSpecific request from ${event.requestedBy}: ${event.instructions}`
       : `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}`;
 
+    // Generic read-only GitHub tools come from the shared package; the
+    // specialized ones (diff-annotated get_pr_diff/read_file, create_inline_comment)
+    // and non-GitHub ones (conventions, memory) stay local in executeTool.
+    const toolCtx: GitHubToolContext = {
+      octokit: ctx.octokit,
+      owner: ctx.owner,
+      repo: ctx.repo,
+      prNumber: ctx.pullNumber,
+      ref: ctx.headSha,
+    };
+
     const agent = new BedrockAgent({ logPrefix: `[reviewer] PR #${event.pr.number}`, maxIterations: MAX_ITERATIONS });
     await agent.run({
       instructions: SYSTEM_PROMPT,
       request: userRequest,
-      tools: toAgentTools(TOOLS, (name, input) => executeTool(name, input, ctx)),
+      tools: [
+        ...toAgentTools(TOOLS, (name, input) => executeTool(name, input, ctx)),
+        getPrDescriptionTool(toolCtx),
+        listPrFilesTool(toolCtx),
+        getPrCommitsTool(toolCtx),
+      ],
     });
 
     const reviewEvent = ctx.commentsPosted === 0 ? 'APPROVE' : 'REQUEST_CHANGES';
