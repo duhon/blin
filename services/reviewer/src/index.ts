@@ -560,7 +560,7 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
       }
 
       const requestBody = {
-        body: input.body,
+        body: `${input.body}\n<!-- blin -->`,
         path: input.path,
         line: input.line,
         ...(input.start_line ? { start_line: input.start_line, start_side: side } : {}),

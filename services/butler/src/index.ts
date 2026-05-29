@@ -65,6 +65,17 @@ export function register(bus: IEventBus, githubApp: App): void {
         return;
       }
 
+      // Only engage in a review thread when blin is actually involved:
+      // (1) the reply mentions @duhon, or (2) blin started the thread (its
+      // root comment carries the <!-- blin --> marker). Otherwise stay out of
+      // conversations between humans.
+      const mentioned = event.comment.toLowerCase().includes('@duhon');
+      const ownThread = (originalComment.body ?? '').includes('<!-- blin -->');
+      if (!mentioned && !ownThread) {
+        console.log(`[butler] thread reply in PR #${event.pr.number} ignored — not mentioned and not blin's thread`);
+        return;
+      }
+
       const threadReplyEvent: ReviewThreadReplyEvent = {
         type: 'review.thread_reply',
         repo: event.repo,
