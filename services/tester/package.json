@@ -8,7 +8,9 @@
     "dev": "tsx src/index.ts"
   },
   "dependencies": {
+    "@blin/agent": "*",
     "@blin/event-bus": "*",
+    "@blin/github-tools": "*",
     "@octokit/app": "^15.0.0"
   },
   "devDependencies": {

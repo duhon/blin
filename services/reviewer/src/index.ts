@@ -1,12 +1,12 @@
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
 import type { IEventBus, ReviewRequestedEvent, ReviewThreadReplyEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
+import { BedrockAgent, type AgentTool } from '@blin/agent';
 import { knowledgePacks } from './knowledge/index.js';
 
 const s3 = new S3Client({});
 const MEMORY_BUCKET = process.env.BLIN_MEMORY_BUCKET;
 
-const BEDROCK_MODEL = 'us.anthropic.claude-sonnet-4-6';
 const MAX_ITERATIONS = 20;
 const DEFAULT_READ_LIMIT = 200;
 const MAX_READ_LIMIT = 1000;
@@ -16,42 +16,17 @@ const DEFAULT_CONFIG = {
   context_files: [] as string[],
 };
 
-interface BedrockResponse {
-  content: any[];
-  stopReason: string;
-}
-
-async function callBedrock(
-  systemPrompt: string,
-  messages: any[],
-  tools: any[]
-): Promise<BedrockResponse> {
-  const region = process.env.AWS_REGION ?? 'us-east-1';
-  const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
-  const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL)}/converse`;
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      system: [{ text: systemPrompt }],
-      messages,
-      toolConfig: { tools },
-    }),
-  });
-
-  if (!response.ok) {
-    throw new Error(`Bedrock error: ${response.status} ${await response.text()}`);
-  }
-
-  const data = await response.json() as any;
-  return {
-    content: data.output.message.content,
-    stopReason: data.stopReason,
-  };
+/** Convert the converse-style tool specs to @blin/agent AgentTools, delegating execution to `exec`. */
+function toAgentTools(
+  specs: Array<{ toolSpec: { name: string; description: string; inputSchema: { json: Record<string, unknown> } } }>,
+  exec: (name: string, input: any) => Promise<string>,
+): AgentTool[] {
+  return specs.map((s) => ({
+    name: s.toolSpec.name,
+    description: s.toolSpec.description,
+    inputSchema: s.toolSpec.inputSchema.json,
+    run: (input: any) => exec(s.toolSpec.name, input),
+  }));
 }
 
 type HunkRange = { start: number; end: number };
@@ -645,9 +620,12 @@ export function register(bus: IEventBus, githubApp: App): void {
       ? `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}\n\nSpecific request from ${event.requestedBy}: ${event.instructions}`
       : `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}`;
 
-    await runAgentLoop(`[reviewer] PR #${event.pr.number}`, SYSTEM_PROMPT, TOOLS, [
-      { role: 'user', content: [{ text: userRequest }] },
-    ], ctx);
+    const agent = new BedrockAgent({ logPrefix: `[reviewer] PR #${event.pr.number}`, maxIterations: MAX_ITERATIONS });
+    await agent.run({
+      instructions: SYSTEM_PROMPT,
+      request: userRequest,
+      tools: toAgentTools(TOOLS, (name, input) => executeTool(name, input, ctx)),
+    });
 
     const reviewEvent = ctx.commentsPosted === 0 ? 'APPROVE' : 'REQUEST_CHANGES';
     const reviewBody = ctx.commentsPosted === 0
@@ -785,54 +763,11 @@ ${event.reply.author} replied:
 
 Respond to their reply.`;
 
-    await runAgentLoop(`[reviewer] thread PR #${event.pr.number}`, THREAD_SYSTEM_PROMPT, THREAD_TOOLS, [
-      { role: 'user', content: [{ text: initialMessage }] },
-    ], ctx, threadExecuteTool);
+    const agent = new BedrockAgent({ logPrefix: `[reviewer] thread PR #${event.pr.number}`, maxIterations: MAX_ITERATIONS });
+    await agent.run({
+      instructions: THREAD_SYSTEM_PROMPT,
+      request: initialMessage,
+      tools: toAgentTools(THREAD_TOOLS, threadExecuteTool),
+    });
   });
-}
-
-async function runAgentLoop(
-  logPrefix: string,
-  systemPrompt: string,
-  tools: any[],
-  messages: any[],
-  ctx: ReviewContext,
-  toolExecutor?: (name: string, input: any) => Promise<string>
-): Promise<void> {
-  for (let i = 0; i < MAX_ITERATIONS; i++) {
-    console.log(`${logPrefix} --- iteration ${i + 1}/${MAX_ITERATIONS} ---`);
-    const response = await callBedrock(systemPrompt, messages, tools);
-    messages.push({ role: 'assistant', content: response.content });
-
-    for (const block of response.content) {
-      if (block.text) {
-        console.log(`${logPrefix} claude text: ${block.text.slice(0, 300)}${block.text.length > 300 ? '...' : ''}`);
-      }
-    }
-
-    if (response.stopReason === 'end_turn') {
-      console.log(`${logPrefix} done`);
-      break;
-    }
-
-    const toolResults: any[] = [];
-    for (const block of response.content) {
-      if (block.toolUse) {
-        console.log(`${logPrefix} tool: ${block.toolUse.name} input=${JSON.stringify(block.toolUse.input).slice(0, 500)}`);
-        const result = toolExecutor
-          ? await toolExecutor(block.toolUse.name, block.toolUse.input)
-          : await executeTool(block.toolUse.name, block.toolUse.input, ctx);
-        console.log(`${logPrefix} tool result (first 300 chars): ${result.slice(0, 300)}${result.length > 300 ? '...' : ''}`);
-        toolResults.push({
-          toolResult: {
-            toolUseId: block.toolUse.toolUseId,
-            content: [{ text: result }],
-          },
-        });
-      }
-    }
-
-    if (toolResults.length === 0) break;
-    messages.push({ role: 'user', content: toolResults });
-  }
 }

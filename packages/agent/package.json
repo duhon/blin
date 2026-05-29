@@ -1,19 +1,14 @@
 {
-  "name": "@blin/butler",
+  "name": "@blin/agent",
   "version": "1.0.0",
   "private": true,
   "main": "dist/index.js",
+  "types": "dist/index.d.ts",
   "scripts": {
     "build": "tsc",
-    "dev": "tsx src/index.ts"
-  },
-  "dependencies": {
-    "@blin/agent": "*",
-    "@blin/event-bus": "*",
-    "@octokit/app": "^15.0.0"
+    "dev": "tsc --watch"
   },
   "devDependencies": {
-    "tsx": "*",
     "typescript": "*"
   },
   "type": "module"

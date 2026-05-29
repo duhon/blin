@@ -1,8 +1,9 @@
 import type { IEventBus, CheckRunCompletedEvent, TestAnalysisRequestedEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
-import type { Octokit } from '@octokit/core';
+import { BedrockAgent } from '@blin/agent';
+import { getPrDescriptionTool, getPrDiffTool, readFileTool, type GitHubToolContext } from '@blin/github-tools';
 
-const BEDROCK_MODEL = 'us.anthropic.claude-sonnet-4-6';
+const MAX_ITERATIONS = 8;
 
 interface TestFailure {
   name: string;
@@ -98,30 +99,6 @@ function parseConsoleErrors(html: string): TestFailure[] {
   return failures;
 }
 
-const ANALYSIS_SYSTEM_PROMPT = `You are a senior PHP engineer triaging failed CI tests on a GitHub pull request for Magento.
-
-A test can fail for one of two reasons:
-1. A real defect in the PR's code (the test correctly caught a bug).
-2. A problem in the test itself (flaky, wrong expectation, broken data provider, etc.).
-
-Critical guidance:
-- DEFAULT to assuming the failure is a REAL problem in the PR's code. This is by far the most common case. Only conclude it's a test problem when the evidence clearly points there.
-- NEVER suggest changing or "fixing" the test when the test has actually uncovered a real problem in the code — that would hide the bug. Fix the code, not the messenger.
-- Only propose a test fix when the failure is genuinely a test-side issue (e.g. an obviously wrong assertion, a missing/misconfigured @dataProvider, environment assumptions).
-- Take the Build configuration into account (PHP version, Magento version, editions, dependency versions). A failure may be specific to a PHP/Magento version — say so when relevant.
-
-You may be given several DISTINCT failures from one check. Judge each on its own merits.
-
-Respond in EXACTLY this format (nothing before "VERDICT:"):
-
-VERDICT: <one short sentence summarizing across ALL failures — how many distinct failures, and the split between code problems and test problems, e.g. "3 distinct failures: 2 code problems, 1 test problem">
----
-<For EACH distinct failure, one Markdown section:>
-### <test name(s)> — <Code problem | Test problem>
-<the core error with file:line, why it fails, and a concrete fix / next step. If it's a code problem, point at the likely code area — do NOT suggest editing the test.>
-
-Be direct and brief. No filler.`;
-
 /** Split the model's "VERDICT: …\n---\n<details>" response into its two parts. */
 function splitVerdict(raw: string): { verdict: string; details: string } {
   const sep = raw.match(/\n\s*-{3,}\s*\n/);
@@ -139,65 +116,77 @@ function splitVerdict(raw: string): { verdict: string; details: string } {
   return { verdict, details };
 }
 
-async function analyzeFailures(buildConfig: string, groups: FailureGroup[]): Promise<{ verdict: string; details: string }> {
-  const region = process.env.AWS_REGION ?? 'us-east-1';
-  const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
-  const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL)}/converse`;
+const SYSTEM_PROMPT = `You are a senior PHP engineer triaging failed CI tests on a GitHub pull request for Magento.
 
-  const failureText = groups
-    .map((g, i) => `### Failure ${i + 1} — failed in: ${g.names.join(', ')}\n\n${g.error}`)
-    .join('\n\n');
+A test can fail for one of two reasons:
+1. A real defect in the PR's code (the test correctly caught a bug).
+2. A problem in the test itself (flaky, wrong expectation, broken data provider, etc.).
 
-  const userText = `${buildConfig ? `${buildConfig}\n\n---\n\n` : ''}Failed tests (${groups.length} distinct):\n\n${failureText}`;
+You have tools to inspect the pull request at its head revision:
+- get_pr_description — the PR title and description (the author's intent: what changed and the problem being solved). Call this FIRST. The title often carries the intent when the description is thin or empty.
+- read_file — read the failing test and the code it exercises (start from the file:line in the stack trace).
+- get_pr_diff — see exactly what the PR changed, and the real file paths in this repo.
+INVESTIGATE before judging: start with get_pr_description for intent, then read the failing test around the reported file:line, read the code under test, and check the diff to see whether the PR changed the relevant code. A failure may be an expected consequence of the change the PR should have handled, or unrelated — weigh the intent against what the code and diff actually show. A grounded verdict beats a guess.
 
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      system: [{ text: ANALYSIS_SYSTEM_PROMPT }],
-      messages: [{ role: 'user', content: [{ text: userText }] }],
-    }),
-  });
+Critical guidance:
+- DEFAULT to assuming the failure is a REAL problem in the PR's code. This is by far the most common case. Only conclude it's a test problem when the code you read clearly shows the test itself is at fault.
+- NEVER suggest changing or "fixing" the test when the test has actually uncovered a real problem in the code — that would hide the bug. Fix the code, not the messenger.
+- Only propose a test fix when the failure is genuinely a test-side issue (e.g. a wrong assertion, a missing/misconfigured @dataProvider, environment assumptions).
+- Take the Build configuration into account (PHP version, Magento version, editions). A failure may be specific to a PHP/Magento version — say so when relevant.
 
-  if (!response.ok) {
-    throw new Error(`Bedrock error: ${response.status} ${await response.text()}`);
-  }
+You may be given several DISTINCT failures from one check. Judge each on its own merits.
 
-  const data = await response.json() as any;
-  return splitVerdict(data.output?.message?.content?.[0]?.text?.trim() ?? '');
-}
+When done investigating, respond in EXACTLY this format (nothing before "VERDICT:"):
 
+VERDICT: <one short sentence summarizing across ALL failures — how many distinct failures, and the split between code problems and test problems, e.g. "3 distinct failures: 2 code problems, 1 test problem">
+---
+<For EACH distinct failure, one Markdown section:>
+### <test name(s)> — <Code problem | Test problem>
+<the core error with file:line, what you found in the code, and a concrete fix / next step. If it's a code problem, point at the specific code — do NOT suggest editing the test.>
+
+Be direct and brief. Cite the file:line you actually read. No filler.`;
+
+/**
+ * Post a PR comment via GITHUB_REVIEWER_PAT (not the App installation token),
+ * so it appears under the human account — matching how the reviewer posts —
+ * instead of as "blin-bot".
+ */
 async function postComment(
-  octokit: Octokit,
   repo: { owner: string; name: string },
   prNumber: number,
   body: string,
 ): Promise<void> {
-  await octokit.request('POST /repos/{owner}/{repo}/issues/{issue_number}/comments', {
-    owner: repo.owner,
-    repo: repo.name,
-    issue_number: prNumber,
-    body: `${body}\n<!-- blin -->`,
-  });
+  const res = await fetch(
+    `https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${prNumber}/comments`,
+    {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${process.env.GITHUB_REVIEWER_PAT}`,
+        'Content-Type': 'application/json',
+        'Accept': 'application/vnd.github.v3+json',
+      },
+      body: JSON.stringify({ body: `${body}\n<!-- blin -->` }),
+    },
+  );
+  if (!res.ok) {
+    console.error(`[tester] failed to post comment on PR #${prNumber} (${res.status}): ${await res.text()}`);
+  }
 }
 
 /**
- * Analyze one failed check run's PHPUnit report and post the result as a PR
- * comment. Returns true if a comment was posted, false if there was nothing to
- * analyze (e.g. non-PHPUnit check with no console-error-logs link).
+ * Analyze one failed check run's PHPUnit report — investigating the repo via an
+ * agent loop — and post the result as a PR comment. Returns true if a comment
+ * was posted, false if there was nothing to analyze.
  */
 async function analyzeAndPost(
-  octokit: Octokit,
+  octokit: any,
   repo: { owner: string; name: string },
+  ref: string,
   prNumber: number,
   checkRunName: string,
   output: { summary?: string | null; text?: string | null },
 ): Promise<boolean> {
-  const summary = output.summary ?? '';
-  const logUrl = findConsoleLogUrl(summary);
+  const logUrl = findConsoleLogUrl(output.summary ?? '');
   if (!logUrl) {
     console.log(`[tester] no console-error-logs link in "${checkRunName}", skipping (non-PHPUnit check)`);
     return false;
@@ -227,14 +216,36 @@ async function analyzeAndPost(
   const omitted = groups.length - shown.length;
   console.log(`[tester] "${checkRunName}": ${failures.length} runs → ${groups.length} distinct failure(s)${omitted > 0 ? `, analyzing first ${MAX_FAILURES}` : ''}`);
 
-  let verdict: string;
-  let details: string;
+  const buildConfig = extractBuildConfig(output.text ?? '');
+  const failureText = shown
+    .map((g, i) => `### Failure ${i + 1} — failed in: ${g.names.join(', ')}\n\n${g.error}`)
+    .join('\n\n');
+  const userMessage =
+    `${buildConfig ? `${buildConfig}\n\n---\n\n` : ''}Check: ${checkRunName}\n` +
+    `Failed tests (${shown.length} distinct):\n\n${failureText}\n\n` +
+    `Investigate with get_pr_description / read_file / get_pr_diff, then give your verdict.`;
+
+  const agent = new BedrockAgent({ logPrefix: `[tester] PR #${prNumber} "${checkRunName}"`, maxIterations: MAX_ITERATIONS });
+  const toolCtx: GitHubToolContext = { octokit, owner: repo.owner, repo: repo.name, prNumber, ref };
+
+  let raw: string;
   try {
-    ({ verdict, details } = await analyzeFailures(extractBuildConfig(output.text ?? ''), shown));
+    const result = await agent.run({
+      instructions: SYSTEM_PROMPT,
+      request: userMessage,
+      tools: [
+        getPrDescriptionTool(toolCtx),
+        readFileTool(toolCtx, { stripPrefix: /^\/var\/www\/html\// }),
+        getPrDiffTool(toolCtx),
+      ],
+    });
+    raw = result.text;
   } catch (err) {
     console.error(`[tester] analysis failed for "${checkRunName}":`, err);
     return false;
   }
+
+  const { verdict, details } = splitVerdict(raw);
   if (!verdict) return false;
 
   // Header + verdict stay visible; the per-failure breakdown and fixes go under
@@ -246,7 +257,7 @@ async function analyzeAndPost(
     (details
       ? `\n\n<details>\n<summary>Details &amp; suggested fix</summary>\n\n${details}${omittedNote}\n\n</details>`
       : omittedNote);
-  await postComment(octokit, repo, prNumber, body);
+  await postComment(repo, prNumber, body);
   console.log(`[tester] posted failure analysis for "${checkRunName}" on PR #${prNumber}`);
   return true;
 }
@@ -267,7 +278,7 @@ export function register(bus: IEventBus, githubApp: App): void {
         repo: event.repo.name,
         check_run_id: event.checkRunId,
       });
-      await analyzeAndPost(octokit, event.repo, event.pr.number, event.checkRunName, data.output);
+      await analyzeAndPost(octokit, event.repo, data.head_sha, event.pr.number, event.checkRunName, data.output);
     } catch (err) {
       console.error(`[tester] failed to handle check run ${event.checkRunId}:`, err);
     }
@@ -300,12 +311,12 @@ export function register(bus: IEventBus, githubApp: App): void {
       console.log(`[tester] ${failed.length}/${checks.total_count} checks failing on ${pr.head.sha.slice(0, 7)}`);
 
       if (failed.length === 0) {
-        await postComment(octokit, event.repo, event.pr.number,
+        await postComment(event.repo, event.pr.number,
           `## 🧪 Test failure analysis\n\nNo failing checks on the latest commit (\`${pr.head.sha.slice(0, 7)}\`) — everything's green. ✅`);
         return;
       }
 
-      // Fan out: one event per failing check → the per-check handler below runs
+      // Fan out: one event per failing check → the per-check handler above runs
       // them concurrently (the bus dispatches via Promise.all).
       await Promise.all(failed.map((c) => bus.publish({
         type: 'tests.check_run_completed',

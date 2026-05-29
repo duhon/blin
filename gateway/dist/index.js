@@ -4007,34 +4007,113 @@ function registerWebhookHandlers(webhooks3, bus) {
   });
 }
 
+// ../packages/agent/dist/index.js
+var DEFAULT_MODEL = "us.anthropic.claude-sonnet-4-6";
+var DEFAULT_MAX_ITERATIONS = 8;
+var BedrockAgent = class {
+  model;
+  maxIterations;
+  region;
+  bearerToken;
+  logPrefix;
+  constructor(opts = {}) {
+    this.model = opts.model ?? DEFAULT_MODEL;
+    this.maxIterations = opts.maxIterations ?? DEFAULT_MAX_ITERATIONS;
+    this.region = opts.region ?? process.env.AWS_REGION ?? "us-east-1";
+    this.bearerToken = opts.bearerToken;
+    this.logPrefix = opts.logPrefix ?? "[agent]";
+  }
+  async call(systemPrompt, messages, tools) {
+    const token = this.bearerToken ?? process.env.AWS_BEARER_TOKEN_BEDROCK;
+    const url = `https://bedrock-runtime.${this.region}.amazonaws.com/model/${encodeURIComponent(this.model)}/converse`;
+    const toolConfig = tools.length ? {
+      toolConfig: {
+        tools: tools.map((t) => ({
+          toolSpec: {
+            name: t.name,
+            description: t.description,
+            inputSchema: { json: t.inputSchema }
+          }
+        }))
+      }
+    } : {};
+    const res = await fetch(url, {
+      method: "POST",
+      headers: {
+        "Authorization": `Bearer ${token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify({ system: [{ text: systemPrompt }], messages, ...toolConfig })
+    });
+    if (!res.ok) {
+      throw new Error(`Bedrock error: ${res.status} ${await res.text()}`);
+    }
+    const data = await res.json();
+    return { content: data.output.message.content, stopReason: data.stopReason };
+  }
+  /**
+   * Drive the tool-use loop and return the agent's final text output.
+   */
+  async run(req) {
+    const systemPrompt = req.context ? `${req.instructions}
+
+## Context
+${req.context}` : req.instructions;
+    const tools = req.tools ?? [];
+    const byName = new Map(tools.map((t) => [t.name, t]));
+    const messages = [{ role: "user", content: [{ text: req.request }] }];
+    let finalText = "";
+    for (let i = 0; i < this.maxIterations; i++) {
+      const response = await this.call(systemPrompt, messages, tools);
+      messages.push({ role: "assistant", content: response.content });
+      const text = response.content.filter((b) => b.text).map((b) => b.text).join("\n").trim();
+      if (text) {
+        finalText = text;
+        console.log(`${this.logPrefix} text: ${text.slice(0, 200)}${text.length > 200 ? "\u2026" : ""}`);
+      }
+      if (response.stopReason === "end_turn")
+        break;
+      const toolResults = [];
+      for (const block of response.content) {
+        if (!block.toolUse)
+          continue;
+        const tool = byName.get(block.toolUse.name);
+        console.log(`${this.logPrefix} tool: ${block.toolUse.name} ${JSON.stringify(block.toolUse.input).slice(0, 200)}`);
+        let result;
+        try {
+          result = tool ? await tool.run(block.toolUse.input) : `Unknown tool: ${block.toolUse.name}`;
+        } catch (err) {
+          result = `Tool ${block.toolUse.name} failed: ${err.message}`;
+        }
+        toolResults.push({
+          toolResult: { toolUseId: block.toolUse.toolUseId, content: [{ text: result }] }
+        });
+      }
+      if (toolResults.length === 0)
+        break;
+      messages.push({ role: "user", content: toolResults });
+    }
+    return { text: finalText };
+  }
+};
+
 // ../services/butler/dist/index.js
-var BEDROCK_MODEL = "us.anthropic.claude-sonnet-4-6";
-async function classifyIntent(comment) {
-  const region = process.env.AWS_REGION ?? "us-east-1";
-  const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
-  const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL)}/converse`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${token}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      system: [{ text: `You are a dispatcher for a GitHub bot. Classify the user's intent from their PR comment.
+var DISPATCHER_INSTRUCTIONS = `You are a dispatcher for a GitHub bot. Classify the user's intent from their PR comment.
 Reply with exactly one word:
 - "review" \u2014 user wants a code review of the PR
 - "question" \u2014 user is asking a question about the code, the PR, or how something works
 - "tests" \u2014 user wants to know why the CI tests/checks are failing or wants the failing tests analyzed
-- "unknown" \u2014 anything else` }],
-      messages: [{ role: "user", content: [{ text: comment }] }]
-    })
-  });
-  if (!response.ok) {
-    console.error(`[butler] bedrock error: ${response.status}`);
+- "unknown" \u2014 anything else`;
+var dispatcher = new BedrockAgent({ logPrefix: "[butler]", maxIterations: 1 });
+async function classifyIntent(comment) {
+  let text = "";
+  try {
+    const result = await dispatcher.run({ instructions: DISPATCHER_INSTRUCTIONS, request: comment });
+    text = result.text.trim().toLowerCase();
+  } catch (err) {
+    console.error(`[butler] classify error:`, err);
     return "unknown";
   }
-  const data = await response.json();
-  const text = data.output?.message?.content?.[0]?.text?.trim().toLowerCase() ?? "";
   console.log(`[butler] classified "${comment.slice(0, 80)}" \u2192 ${text}`);
   if (text.startsWith("review"))
     return "review";
@@ -4326,7 +4405,6 @@ var knowledgePacks = {
 // ../services/reviewer/dist/index.js
 var s3 = new import_client_s3.S3Client({});
 var MEMORY_BUCKET = process.env.BLIN_MEMORY_BUCKET;
-var BEDROCK_MODEL2 = "us.anthropic.claude-sonnet-4-6";
 var MAX_ITERATIONS = 20;
 var DEFAULT_READ_LIMIT = 200;
 var MAX_READ_LIMIT = 1e3;
@@ -4334,30 +4412,13 @@ var DEFAULT_CONFIG = {
   knowledge: ["basic"],
   context_files: []
 };
-async function callBedrock(systemPrompt, messages, tools) {
-  const region = process.env.AWS_REGION ?? "us-east-1";
-  const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
-  const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL2)}/converse`;
-  const response = await fetch(url, {
-    method: "POST",
-    headers: {
-      "Authorization": `Bearer ${token}`,
-      "Content-Type": "application/json"
-    },
-    body: JSON.stringify({
-      system: [{ text: systemPrompt }],
-      messages,
-      toolConfig: { tools }
-    })
-  });
-  if (!response.ok) {
-    throw new Error(`Bedrock error: ${response.status} ${await response.text()}`);
-  }
-  const data = await response.json();
-  return {
-    content: data.output.message.content,
-    stopReason: data.stopReason
-  };
+function toAgentTools(specs, exec) {
+  return specs.map((s) => ({
+    name: s.toolSpec.name,
+    description: s.toolSpec.description,
+    inputSchema: s.toolSpec.inputSchema.json,
+    run: (input) => exec(s.toolSpec.name, input)
+  }));
 }
 function processDiff(diff) {
   const lines = diff.split("\n");
@@ -4902,9 +4963,12 @@ function register3(bus, githubApp) {
     const userRequest = event.instructions ? `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}
 
 Specific request from ${event.requestedBy}: ${event.instructions}` : `Review PR #${event.pr.number}: "${event.pr.title}" in ${event.repo.fullName}`;
-    await runAgentLoop(`[reviewer] PR #${event.pr.number}`, SYSTEM_PROMPT, TOOLS, [
-      { role: "user", content: [{ text: userRequest }] }
-    ], ctx);
+    const agent = new BedrockAgent({ logPrefix: `[reviewer] PR #${event.pr.number}`, maxIterations: MAX_ITERATIONS });
+    await agent.run({
+      instructions: SYSTEM_PROMPT,
+      request: userRequest,
+      tools: toAgentTools(TOOLS, (name, input) => executeTool(name, input, ctx))
+    });
     const reviewEvent = ctx.commentsPosted === 0 ? "APPROVE" : "REQUEST_CHANGES";
     const reviewBody = ctx.commentsPosted === 0 ? `Looks good to me \u{1F44D}` : `Found ${ctx.commentsPosted} critical issue${ctx.commentsPosted > 1 ? "s" : ""}. Please address the inline comments.`;
     const reviewRes = await fetch(`https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/reviews`, {
@@ -5025,43 +5089,13 @@ ${event.reply.author} replied:
 > ${event.reply.body}
 
 Respond to their reply.`;
-    await runAgentLoop(`[reviewer] thread PR #${event.pr.number}`, THREAD_SYSTEM_PROMPT, THREAD_TOOLS, [
-      { role: "user", content: [{ text: initialMessage }] }
-    ], ctx, threadExecuteTool);
+    const agent = new BedrockAgent({ logPrefix: `[reviewer] thread PR #${event.pr.number}`, maxIterations: MAX_ITERATIONS });
+    await agent.run({
+      instructions: THREAD_SYSTEM_PROMPT,
+      request: initialMessage,
+      tools: toAgentTools(THREAD_TOOLS, threadExecuteTool)
+    });
   });
-}
-async function runAgentLoop(logPrefix, systemPrompt, tools, messages, ctx, toolExecutor) {
-  for (let i = 0; i < MAX_ITERATIONS; i++) {
-    console.log(`${logPrefix} --- iteration ${i + 1}/${MAX_ITERATIONS} ---`);
-    const response = await callBedrock(systemPrompt, messages, tools);
-    messages.push({ role: "assistant", content: response.content });
-    for (const block of response.content) {
-      if (block.text) {
-        console.log(`${logPrefix} claude text: ${block.text.slice(0, 300)}${block.text.length > 300 ? "..." : ""}`);
-      }
-    }
-    if (response.stopReason === "end_turn") {
-      console.log(`${logPrefix} done`);
-      break;
-    }
-    const toolResults = [];
-    for (const block of response.content) {
-      if (block.toolUse) {
-        console.log(`${logPrefix} tool: ${block.toolUse.name} input=${JSON.stringify(block.toolUse.input).slice(0, 500)}`);
-        const result = toolExecutor ? await toolExecutor(block.toolUse.name, block.toolUse.input) : await executeTool(block.toolUse.name, block.toolUse.input, ctx);
-        console.log(`${logPrefix} tool result (first 300 chars): ${result.slice(0, 300)}${result.length > 300 ? "..." : ""}`);
-        toolResults.push({
-          toolResult: {
-            toolUseId: block.toolUse.toolUseId,
-            content: [{ text: result }]
-          }
-        });
-      }
-    }
-    if (toolResults.length === 0)
-      break;
-    messages.push({ role: "user", content: toolResults });
-  }
 }
 
 // ../services/analyst/dist/index.js
@@ -5072,8 +5106,108 @@ function register4(bus, githubApp) {
   });
 }
 
+// ../packages/github-tools/dist/index.js
+var DEFAULT_READ_LIMIT2 = 200;
+var MAX_READ_LIMIT2 = 800;
+var MAX_DIFF_CHARS = 12e3;
+function getPrDescriptionTool(ctx) {
+  return {
+    name: "get_pr_description",
+    description: "The pull request's title and description \u2014 the author's intent: what changed and the problem being solved. The title often carries the intent when the description is thin.",
+    inputSchema: { type: "object", properties: {} },
+    async run() {
+      try {
+        const { data: pr } = await ctx.octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
+          owner: ctx.owner,
+          repo: ctx.repo,
+          pull_number: ctx.prNumber
+        });
+        return JSON.stringify({
+          title: pr.title,
+          description: (pr.body ?? "").trim() || "(no description provided)",
+          base: pr.base?.ref,
+          head: pr.head?.ref
+        });
+      } catch (e) {
+        return `Could not fetch PR description: ${e?.status ?? e?.message ?? e}`;
+      }
+    }
+  };
+}
+function getPrDiffTool(ctx) {
+  return {
+    name: "get_pr_diff",
+    description: "Get the unified diff of the PR to see what changed and the real file paths in this repo.",
+    inputSchema: { type: "object", properties: {} },
+    async run() {
+      try {
+        const resp = await ctx.octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
+          owner: ctx.owner,
+          repo: ctx.repo,
+          pull_number: ctx.prNumber,
+          mediaType: { format: "diff" }
+        });
+        const diff = String(resp.data ?? "");
+        if (!diff)
+          return "(empty diff)";
+        return diff.length > MAX_DIFF_CHARS ? `${diff.slice(0, MAX_DIFF_CHARS)}
+\u2026(diff truncated)` : diff;
+      } catch (e) {
+        return `Could not fetch PR diff: ${e?.status ?? e?.message ?? e}`;
+      }
+    }
+  };
+}
+function readFileTool(ctx, opts = {}) {
+  const defaultLimit = opts.defaultLimit ?? DEFAULT_READ_LIMIT2;
+  const maxLimit = opts.maxLimit ?? MAX_READ_LIMIT2;
+  return {
+    name: "read_file",
+    description: `Read a slice of a file at the PR head revision, returned with line numbers. Paginate with offset+limit (default ${defaultLimit}, max ${maxLimit}).`,
+    inputSchema: {
+      type: "object",
+      properties: {
+        path: { type: "string", description: "Repo-relative file path." },
+        offset: { type: "number", description: "1-based start line. Default 1." },
+        limit: { type: "number", description: `Max lines to return. Default ${defaultLimit}, max ${maxLimit}.` }
+      },
+      required: ["path"]
+    },
+    async run(input) {
+      let path = String(input.path ?? "").trim();
+      if (opts.stripPrefix)
+        path = path.replace(opts.stripPrefix, "");
+      path = path.replace(/^\/+/, "");
+      if (!path)
+        return "Provide a non-empty path.";
+      const offset = Math.max(1, Number(input.offset) || 1);
+      const limit = Math.min(Number(input.limit) || defaultLimit, maxLimit);
+      try {
+        const { data } = await ctx.octokit.request("GET /repos/{owner}/{repo}/contents/{path}", {
+          owner: ctx.owner,
+          repo: ctx.repo,
+          path,
+          ref: ctx.ref
+        });
+        if (Array.isArray(data) || data.type !== "file" || !data.content) {
+          return `'${path}' is not a readable file (maybe a directory).`;
+        }
+        const content = Buffer.from(data.content, "base64").toString("utf8");
+        const lines = content.split("\n");
+        const out = lines.slice(offset - 1, offset - 1 + limit).map((l, i) => `${offset + i}	${l}`).join("\n");
+        const footer = `
+
+(file has ${lines.length} lines; showed ${offset}\u2013${Math.min(offset + limit - 1, lines.length)})`;
+        return (out || "(no lines in that range)") + footer;
+      } catch (e) {
+        return `Could not read '${path}' at ${ctx.ref.slice(0, 7)}: ${e?.status ?? e?.message ?? e}. Use get_pr_diff to discover the real file paths in this repo.`;
+      }
+    }
+  };
+}
+
 // ../services/tester/dist/index.js
-var BEDROCK_MODEL3 = "us.anthropic.claude-sonnet-4-6";
+var MAX_ITERATIONS2 = 8;
 var MAX_FAILURES = 10;
 function dedupeFailures(failures) {
   const map = /* @__PURE__ */ new Map();
@@ -5121,29 +5255,6 @@ function parseConsoleErrors(html) {
   }
   return failures;
 }
-var ANALYSIS_SYSTEM_PROMPT = `You are a senior PHP engineer triaging failed CI tests on a GitHub pull request for Magento.
-
-A test can fail for one of two reasons:
-1. A real defect in the PR's code (the test correctly caught a bug).
-2. A problem in the test itself (flaky, wrong expectation, broken data provider, etc.).
-
-Critical guidance:
-- DEFAULT to assuming the failure is a REAL problem in the PR's code. This is by far the most common case. Only conclude it's a test problem when the evidence clearly points there.
-- NEVER suggest changing or "fixing" the test when the test has actually uncovered a real problem in the code \u2014 that would hide the bug. Fix the code, not the messenger.
-- Only propose a test fix when the failure is genuinely a test-side issue (e.g. an obviously wrong assertion, a missing/misconfigured @dataProvider, environment assumptions).
-- Take the Build configuration into account (PHP version, Magento version, editions, dependency versions). A failure may be specific to a PHP/Magento version \u2014 say so when relevant.
-
-You may be given several DISTINCT failures from one check. Judge each on its own merits.
-
-Respond in EXACTLY this format (nothing before "VERDICT:"):
-
-VERDICT: <one short sentence summarizing across ALL failures \u2014 how many distinct failures, and the split between code problems and test problems, e.g. "3 distinct failures: 2 code problems, 1 test problem">
----
-<For EACH distinct failure, one Markdown section:>
-### <test name(s)> \u2014 <Code problem | Test problem>
-<the core error with file:line, why it fails, and a concrete fix / next step. If it's a code problem, point at the likely code area \u2014 do NOT suggest editing the test.>
-
-Be direct and brief. No filler.`;
 function splitVerdict(raw) {
   const sep2 = raw.match(/\n\s*-{3,}\s*\n/);
   let verdict;
@@ -5159,49 +5270,52 @@ function splitVerdict(raw) {
   verdict = verdict.replace(/^\**\s*verdict:?\s*\**\s*/i, "").trim();
   return { verdict, details };
 }
-async function analyzeFailures(buildConfig, groups) {
-  const region = process.env.AWS_REGION ?? "us-east-1";
-  const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
-  const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL3)}/converse`;
-  const failureText = groups.map((g, i) => `### Failure ${i + 1} \u2014 failed in: ${g.names.join(", ")}
+var SYSTEM_PROMPT2 = `You are a senior PHP engineer triaging failed CI tests on a GitHub pull request for Magento.
 
-${g.error}`).join("\n\n");
-  const userText = `${buildConfig ? `${buildConfig}
+A test can fail for one of two reasons:
+1. A real defect in the PR's code (the test correctly caught a bug).
+2. A problem in the test itself (flaky, wrong expectation, broken data provider, etc.).
 
+You have tools to inspect the pull request at its head revision:
+- get_pr_description \u2014 the PR title and description (the author's intent: what changed and the problem being solved). Call this FIRST. The title often carries the intent when the description is thin or empty.
+- read_file \u2014 read the failing test and the code it exercises (start from the file:line in the stack trace).
+- get_pr_diff \u2014 see exactly what the PR changed, and the real file paths in this repo.
+INVESTIGATE before judging: start with get_pr_description for intent, then read the failing test around the reported file:line, read the code under test, and check the diff to see whether the PR changed the relevant code. A failure may be an expected consequence of the change the PR should have handled, or unrelated \u2014 weigh the intent against what the code and diff actually show. A grounded verdict beats a guess.
+
+Critical guidance:
+- DEFAULT to assuming the failure is a REAL problem in the PR's code. This is by far the most common case. Only conclude it's a test problem when the code you read clearly shows the test itself is at fault.
+- NEVER suggest changing or "fixing" the test when the test has actually uncovered a real problem in the code \u2014 that would hide the bug. Fix the code, not the messenger.
+- Only propose a test fix when the failure is genuinely a test-side issue (e.g. a wrong assertion, a missing/misconfigured @dataProvider, environment assumptions).
+- Take the Build configuration into account (PHP version, Magento version, editions). A failure may be specific to a PHP/Magento version \u2014 say so when relevant.
+
+You may be given several DISTINCT failures from one check. Judge each on its own merits.
+
+When done investigating, respond in EXACTLY this format (nothing before "VERDICT:"):
+
+VERDICT: <one short sentence summarizing across ALL failures \u2014 how many distinct failures, and the split between code problems and test problems, e.g. "3 distinct failures: 2 code problems, 1 test problem">
 ---
+<For EACH distinct failure, one Markdown section:>
+### <test name(s)> \u2014 <Code problem | Test problem>
+<the core error with file:line, what you found in the code, and a concrete fix / next step. If it's a code problem, point at the specific code \u2014 do NOT suggest editing the test.>
 
-` : ""}Failed tests (${groups.length} distinct):
-
-${failureText}`;
-  const response = await fetch(url, {
+Be direct and brief. Cite the file:line you actually read. No filler.`;
+async function postComment(repo, prNumber, body) {
+  const res = await fetch(`https://api.github.com/repos/${repo.owner}/${repo.name}/issues/${prNumber}/comments`, {
     method: "POST",
     headers: {
-      "Authorization": `Bearer ${token}`,
-      "Content-Type": "application/json"
+      "Authorization": `Bearer ${process.env.GITHUB_REVIEWER_PAT}`,
+      "Content-Type": "application/json",
+      "Accept": "application/vnd.github.v3+json"
     },
-    body: JSON.stringify({
-      system: [{ text: ANALYSIS_SYSTEM_PROMPT }],
-      messages: [{ role: "user", content: [{ text: userText }] }]
-    })
+    body: JSON.stringify({ body: `${body}
+<!-- blin -->` })
   });
-  if (!response.ok) {
-    throw new Error(`Bedrock error: ${response.status} ${await response.text()}`);
+  if (!res.ok) {
+    console.error(`[tester] failed to post comment on PR #${prNumber} (${res.status}): ${await res.text()}`);
   }
-  const data = await response.json();
-  return splitVerdict(data.output?.message?.content?.[0]?.text?.trim() ?? "");
 }
-async function postComment(octokit, repo, prNumber, body) {
-  await octokit.request("POST /repos/{owner}/{repo}/issues/{issue_number}/comments", {
-    owner: repo.owner,
-    repo: repo.name,
-    issue_number: prNumber,
-    body: `${body}
-<!-- blin -->`
-  });
-}
-async function analyzeAndPost(octokit, repo, prNumber, checkRunName, output) {
-  const summary = output.summary ?? "";
-  const logUrl = findConsoleLogUrl(summary);
+async function analyzeAndPost(octokit, repo, ref, prNumber, checkRunName, output) {
+  const logUrl = findConsoleLogUrl(output.summary ?? "");
   if (!logUrl) {
     console.log(`[tester] no console-error-logs link in "${checkRunName}", skipping (non-PHPUnit check)`);
     return false;
@@ -5226,14 +5340,39 @@ async function analyzeAndPost(octokit, repo, prNumber, checkRunName, output) {
   const shown = groups.slice(0, MAX_FAILURES);
   const omitted = groups.length - shown.length;
   console.log(`[tester] "${checkRunName}": ${failures.length} runs \u2192 ${groups.length} distinct failure(s)${omitted > 0 ? `, analyzing first ${MAX_FAILURES}` : ""}`);
-  let verdict;
-  let details;
+  const buildConfig = extractBuildConfig(output.text ?? "");
+  const failureText = shown.map((g, i) => `### Failure ${i + 1} \u2014 failed in: ${g.names.join(", ")}
+
+${g.error}`).join("\n\n");
+  const userMessage = `${buildConfig ? `${buildConfig}
+
+---
+
+` : ""}Check: ${checkRunName}
+Failed tests (${shown.length} distinct):
+
+${failureText}
+
+Investigate with get_pr_description / read_file / get_pr_diff, then give your verdict.`;
+  const agent = new BedrockAgent({ logPrefix: `[tester] PR #${prNumber} "${checkRunName}"`, maxIterations: MAX_ITERATIONS2 });
+  const toolCtx = { octokit, owner: repo.owner, repo: repo.name, prNumber, ref };
+  let raw;
   try {
-    ({ verdict, details } = await analyzeFailures(extractBuildConfig(output.text ?? ""), shown));
+    const result = await agent.run({
+      instructions: SYSTEM_PROMPT2,
+      request: userMessage,
+      tools: [
+        getPrDescriptionTool(toolCtx),
+        readFileTool(toolCtx, { stripPrefix: /^\/var\/www\/html\// }),
+        getPrDiffTool(toolCtx)
+      ]
+    });
+    raw = result.text;
   } catch (err) {
     console.error(`[tester] analysis failed for "${checkRunName}":`, err);
     return false;
   }
+  const { verdict, details } = splitVerdict(raw);
   if (!verdict)
     return false;
   const countLabel = groups.length > 1 ? ` \xB7 ${groups.length} distinct failures` : "";
@@ -5250,7 +5389,7 @@ ${verdict}` + (details ? `
 ${details}${omittedNote}
 
 </details>` : omittedNote);
-  await postComment(octokit, repo, prNumber, body);
+  await postComment(repo, prNumber, body);
   console.log(`[tester] posted failure analysis for "${checkRunName}" on PR #${prNumber}`);
   return true;
 }
@@ -5268,7 +5407,7 @@ function register5(bus, githubApp) {
         repo: event.repo.name,
         check_run_id: event.checkRunId
       });
-      await analyzeAndPost(octokit, event.repo, event.pr.number, event.checkRunName, data.output);
+      await analyzeAndPost(octokit, event.repo, data.head_sha, event.pr.number, event.checkRunName, data.output);
     } catch (err) {
       console.error(`[tester] failed to handle check run ${event.checkRunId}:`, err);
     }
@@ -5291,7 +5430,7 @@ function register5(bus, githubApp) {
       const failed = checks.check_runs.filter((c) => c.conclusion === "failure");
       console.log(`[tester] ${failed.length}/${checks.total_count} checks failing on ${pr.head.sha.slice(0, 7)}`);
       if (failed.length === 0) {
-        await postComment(octokit, event.repo, event.pr.number, `## \u{1F9EA} Test failure analysis
+        await postComment(event.repo, event.pr.number, `## \u{1F9EA} Test failure analysis
 
 No failing checks on the latest commit (\`${pr.head.sha.slice(0, 7)}\`) \u2014 everything's green. \u2705`);
         return;

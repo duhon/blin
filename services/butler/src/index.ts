@@ -1,37 +1,25 @@
 import type { IEventBus, PrMentionEvent, ReviewRequestedEvent, AnalystQuestionAskedEvent, ReviewThreadReplyEvent, TestAnalysisRequestedEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
+import { BedrockAgent } from '@blin/agent';
 
-const BEDROCK_MODEL = 'us.anthropic.claude-sonnet-4-6';
-
-async function classifyIntent(comment: string): Promise<'review' | 'question' | 'tests' | 'unknown'> {
-  const region = process.env.AWS_REGION ?? 'us-east-1';
-  const token = process.env.AWS_BEARER_TOKEN_BEDROCK;
-  const url = `https://bedrock-runtime.${region}.amazonaws.com/model/${encodeURIComponent(BEDROCK_MODEL)}/converse`;
-
-  const response = await fetch(url, {
-    method: 'POST',
-    headers: {
-      'Authorization': `Bearer ${token}`,
-      'Content-Type': 'application/json',
-    },
-    body: JSON.stringify({
-      system: [{ text: `You are a dispatcher for a GitHub bot. Classify the user's intent from their PR comment.
+const DISPATCHER_INSTRUCTIONS = `You are a dispatcher for a GitHub bot. Classify the user's intent from their PR comment.
 Reply with exactly one word:
 - "review" — user wants a code review of the PR
 - "question" — user is asking a question about the code, the PR, or how something works
 - "tests" — user wants to know why the CI tests/checks are failing or wants the failing tests analyzed
-- "unknown" — anything else` }],
-      messages: [{ role: 'user', content: [{ text: comment }] }],
-    }),
-  });
+- "unknown" — anything else`;
 
-  if (!response.ok) {
-    console.error(`[butler] bedrock error: ${response.status}`);
+const dispatcher = new BedrockAgent({ logPrefix: '[butler]', maxIterations: 1 });
+
+async function classifyIntent(comment: string): Promise<'review' | 'question' | 'tests' | 'unknown'> {
+  let text = '';
+  try {
+    const result = await dispatcher.run({ instructions: DISPATCHER_INSTRUCTIONS, request: comment });
+    text = result.text.trim().toLowerCase();
+  } catch (err) {
+    console.error(`[butler] classify error:`, err);
     return 'unknown';
   }
-
-  const data = await response.json() as any;
-  const text = data.output?.message?.content?.[0]?.text?.trim().toLowerCase() ?? '';
   console.log(`[butler] classified "${comment.slice(0, 80)}" → ${text}`);
 
   if (text.startsWith('review')) return 'review';
