@@ -659,16 +659,19 @@ export function register(bus: IEventBus, githubApp: App): void {
       for (const n of notesOf(s)) parts.push(section(ICON[n.status] ?? '💡', TITLE[s], n.headline, n.detail));
     }
 
+    // Only APPROVE / REQUEST_CHANGES resolve a requested review — a COMMENT
+    // review leaves the reviewer stuck "pending". So non-blocking findings
+    // still APPROVE (they don't block the merge); only blocking ones request
+    // changes.
     const hasBlocking = ctx.commentsPosted > 0 || ctx.reviewNotes.some((n) => n.status === 'blocking');
-    const hasSuggestion = ctx.reviewNotes.some((n) => n.status === 'suggestion');
-    const reviewEvent = hasBlocking ? 'REQUEST_CHANGES' : hasSuggestion ? 'COMMENT' : 'APPROVE';
+    const reviewEvent = hasBlocking ? 'REQUEST_CHANGES' : 'APPROVE';
 
-    const TITLE_LINE: Record<string, string> = {
-      APPROVE: '## ✅ Review complete — approved',
-      COMMENT: '## 📝 Review complete — no blockers, see notes',
-      REQUEST_CHANGES: '## 🔴 Review complete — changes requested',
-    };
-    const reviewBody = `${TITLE_LINE[reviewEvent]}\n\n${parts.length > 0 ? parts.join('\n\n') : 'Looks good to me 👍'}`;
+    const titleLine = hasBlocking
+      ? '## 🔴 Review complete — changes requested'
+      : parts.length > 0
+        ? '## ✅ Review complete — approved, with notes'
+        : '## ✅ Review complete — approved';
+    const reviewBody = `${titleLine}\n\n${parts.length > 0 ? parts.join('\n\n') : 'Looks good to me 👍'}`;
 
     const reviewRes = await fetch(
       `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/reviews`,
@@ -699,7 +702,7 @@ export function register(bus: IEventBus, githubApp: App): void {
 
 You can use read_file to look up more context if needed.
 
-To post your reply, call reply_to_thread with your response text.
+Write your reply as your FINAL message — just the reply text in GitHub markdown (it is posted verbatim into the thread). Do not call any tool to post it.
 
 Be concise. If their argument is valid, acknowledge it and explain if you're retracting the finding. If you still believe the issue is real, explain why clearly. Do not repeat the original finding verbatim.`;
 
@@ -717,21 +720,6 @@ Be concise. If their argument is valid, acknowledge it and explain if you're ret
                 limit: { type: 'number', description: `Max lines to return. Default ${DEFAULT_READ_LIMIT}, max ${MAX_READ_LIMIT}.` },
               },
               required: ['path'],
-            },
-          },
-        },
-      },
-      {
-        toolSpec: {
-          name: 'reply_to_thread',
-          description: 'Post a reply in the review thread.',
-          inputSchema: {
-            json: {
-              type: 'object',
-              properties: {
-                body: { type: 'string', description: 'Your reply text (GitHub markdown).' },
-              },
-              required: ['body'],
             },
           },
         },
@@ -765,30 +753,6 @@ Be concise. If their argument is valid, acknowledge it and explain if you're ret
 
     const threadExecuteTool = async (name: string, input: any): Promise<string> => {
       if (name === 'read_file') return executeTool('read_file', input, ctx);
-      if (name === 'reply_to_thread') {
-        const res = await fetch(
-          `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/comments`,
-          {
-            method: 'POST',
-            headers: {
-              'Authorization': `Bearer ${pat}`,
-              'Content-Type': 'application/json',
-              'Accept': 'application/vnd.github.v3+json',
-            },
-            body: JSON.stringify({
-              body: `${input.body}\n<!-- blin -->`,
-              in_reply_to: event.originalComment.id,
-            }),
-          }
-        );
-        if (!res.ok) {
-          const err = await res.text();
-          console.error(`[reviewer][thread] reply failed (${res.status}): ${err}`);
-          return `Failed to post reply: ${err}`;
-        }
-        console.log(`[reviewer][thread] reply posted`);
-        return 'Reply posted successfully';
-      }
       return `Unknown tool: ${name}`;
     };
 
@@ -803,10 +767,38 @@ ${event.reply.author} replied:
 Respond to their reply.`;
 
     const agent = new BedrockAgent({ logPrefix: `[reviewer] thread PR #${event.pr.number}`, maxIterations: MAX_ITERATIONS });
-    await agent.run({
+    const { text } = await agent.run({
       instructions: THREAD_SYSTEM_PROMPT,
       request: initialMessage,
       tools: toAgentTools(THREAD_TOOLS, threadExecuteTool),
     });
+
+    const replyText = text.trim();
+    if (!replyText) {
+      console.error(`[reviewer][thread] PR #${event.pr.number}: agent produced no reply text, skipping`);
+      return;
+    }
+
+    // The agent's final text IS the reply — post it into the thread.
+    const res = await fetch(
+      `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/comments`,
+      {
+        method: 'POST',
+        headers: {
+          'Authorization': `Bearer ${pat}`,
+          'Content-Type': 'application/json',
+          'Accept': 'application/vnd.github.v3+json',
+        },
+        body: JSON.stringify({
+          body: `${replyText}\n<!-- blin -->`,
+          in_reply_to: event.originalComment.id,
+        }),
+      }
+    );
+    if (!res.ok) {
+      console.error(`[reviewer][thread] reply failed (${res.status}): ${await res.text()}`);
+    } else {
+      console.log(`[reviewer][thread] reply posted on PR #${event.pr.number}`);
+    }
   });
 }
