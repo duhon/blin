@@ -241,15 +241,17 @@ Recurring risky patterns specific to this codebase that are worth flagging when 
   {
     toolSpec: {
       name: 'add_review_note',
-      description: `Record a PR-level (general) finding for the final review summary — NOT tied to a specific line. Use for the review-plan checks: the PR not actually fixing the described problem, a substantially better alternative approach, tests not having passed, or a missing test covering the fix. Set blocking=true ONLY for "the PR does not fix the described problem" or "tests did not pass"; everything else is a non-blocking suggestion.`,
+      description: `Record a PR-level finding for one step of the review plan (NOT tied to a code line). Each call becomes one collapsible section in the final review. Call it once per applicable step (fix / ci / coverage always; alternative only when relevant).`,
       inputSchema: {
         json: {
           type: 'object',
           properties: {
-            note: { type: 'string', description: 'The finding, in GitHub markdown. Be concise.' },
-            blocking: { type: 'boolean', description: 'true only for "problem not fixed" or "tests not passed"; false otherwise.' },
+            section: { type: 'string', enum: ['fix', 'alternative', 'ci', 'coverage'], description: 'Which review-plan step this is.' },
+            status: { type: 'string', enum: ['ok', 'suggestion', 'blocking'], description: 'ok = fine (✅); suggestion = non-blocking advice (💡); blocking = must fix before merge (🔴).' },
+            headline: { type: 'string', description: 'Short status shown on the collapsed header line, e.g. "no runs found", "No tests added for FeedMigrator", "fix confirmed".' },
+            detail: { type: 'string', description: 'The collapsed body (markdown). For ci, a markdown LIST of the missing/failed checks. Keep it minimal.' },
           },
-          required: ['note', 'blocking'],
+          required: ['section', 'status', 'headline', 'detail'],
         },
       },
     },
@@ -327,8 +329,8 @@ interface ReviewContext {
   pr: { title: string; body: string | null; base: string; head: string };
   diffMap: DiffMap | null;
   commentsPosted: number;
-  /** General (PR-level) findings from the review plan, assembled into the final review body. */
-  reviewNotes: Array<{ note: string; blocking: boolean }>;
+  /** Per-step findings from the review plan, rendered as collapsible sections in the final review body. */
+  reviewNotes: Array<{ section: string; status: string; headline: string; detail: string }>;
 }
 
 async function loadDiffMap(ctx: ReviewContext): Promise<{ annotated: string; map: DiffMap }> {
@@ -438,8 +440,13 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
     }
 
     case 'add_review_note': {
-      ctx.reviewNotes.push({ note: String(input.note ?? '').trim(), blocking: !!input.blocking });
-      return `Noted (${input.blocking ? 'blocking' : 'non-blocking'}).`;
+      ctx.reviewNotes.push({
+        section: String(input.section ?? 'fix'),
+        status: String(input.status ?? 'suggestion'),
+        headline: String(input.headline ?? '').trim(),
+        detail: String(input.detail ?? '').trim(),
+      });
+      return `Noted (${input.section}: ${input.status}).`;
     }
 
     case 'read_file': {
@@ -630,26 +637,38 @@ export function register(bus: IEventBus, githubApp: App): void {
       ],
     });
 
-    // Decide the verdict: REQUEST_CHANGES if there are critical inline issues
-    // or any blocking note (problem-not-fixed / tests-failed); COMMENT if there
-    // are only non-blocking notes; APPROVE if nothing to flag.
-    const blockingNotes = ctx.reviewNotes.filter((n) => n.blocking);
-    const hasBlocking = ctx.commentsPosted > 0 || blockingNotes.length > 0;
-    const reviewEvent = hasBlocking ? 'REQUEST_CHANGES' : (ctx.reviewNotes.length > 0 ? 'COMMENT' : 'APPROVE');
+    // Assemble the final review: one collapsible section per review-plan step,
+    // ordered fix → alternative → critical review → ci → coverage. Verdict:
+    // REQUEST_CHANGES on any blocking section or critical inline issues;
+    // COMMENT if there are only suggestions; APPROVE if everything is ok.
+    const ICON: Record<string, string> = { ok: '✅', suggestion: '💡', blocking: '🔴' };
+    const TITLE: Record<string, string> = { fix: 'Fix verification', alternative: 'Alternative approach', ci: 'CI checks', coverage: 'Test coverage' };
+    const section = (icon: string, title: string, headline: string, detail: string) =>
+      `<details>\n<summary>${icon} ${title}: ${headline}</summary>\n\n${detail}\n\n</details>`;
 
-    let reviewBody: string;
-    if (reviewEvent === 'APPROVE') {
-      reviewBody = 'Looks good to me 👍';
-    } else {
-      const parts: string[] = [];
-      if (ctx.commentsPosted > 0) {
-        parts.push(`Found ${ctx.commentsPosted} critical inline issue${ctx.commentsPosted > 1 ? 's' : ''} — see the comments below.`);
-      }
-      for (const n of ctx.reviewNotes) {
-        parts.push(`${n.blocking ? '🔴' : '💡'} ${n.note}`);
-      }
-      reviewBody = parts.join('\n\n');
+    const notesOf = (s: string) => ctx.reviewNotes.filter((n) => n.section === s);
+    const parts: string[] = [];
+    for (const s of ['fix', 'alternative']) {
+      for (const n of notesOf(s)) parts.push(section(ICON[n.status] ?? '💡', TITLE[s], n.headline, n.detail));
     }
+    if (ctx.commentsPosted > 0) {
+      const n = ctx.commentsPosted;
+      parts.push(section('🔴', 'Critical review', `${n} issue${n > 1 ? 's' : ''}`, `Found ${n} critical inline issue${n > 1 ? 's' : ''} — see the comments below.`));
+    }
+    for (const s of ['ci', 'coverage']) {
+      for (const n of notesOf(s)) parts.push(section(ICON[n.status] ?? '💡', TITLE[s], n.headline, n.detail));
+    }
+
+    const hasBlocking = ctx.commentsPosted > 0 || ctx.reviewNotes.some((n) => n.status === 'blocking');
+    const hasSuggestion = ctx.reviewNotes.some((n) => n.status === 'suggestion');
+    const reviewEvent = hasBlocking ? 'REQUEST_CHANGES' : hasSuggestion ? 'COMMENT' : 'APPROVE';
+
+    const TITLE_LINE: Record<string, string> = {
+      APPROVE: '## ✅ Review complete — approved',
+      COMMENT: '## 📝 Review complete — no blockers, see notes',
+      REQUEST_CHANGES: '## 🔴 Review complete — changes requested',
+    };
+    const reviewBody = `${TITLE_LINE[reviewEvent]}\n\n${parts.length > 0 ? parts.join('\n\n') : 'Looks good to me 👍'}`;
 
     const reviewRes = await fetch(
       `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/reviews`,

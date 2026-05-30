@@ -4578,25 +4578,38 @@ A Magento PR is expected to run this set of checks. When verifying CI (review-pl
 var review_plan_default = `
 # Review plan
 
-Follow these steps in order. (Tool mechanics, the inline-comment rules, and the output format are covered by your system instructions \u2014 this is the review procedure itself, and a repository may override it.)
+Work these steps in order. Each step records its result with ONE add_review_note call (section, status, headline, detail) \u2014 that becomes a collapsible section in the final review. Keep every detail minimal; the developer decides specifics. Always record steps 1, 4 and 5; step 2 only when it applies.
 
-1. Understand & verify the fix. Use get_pr_description (and get_pr_commits if the description is thin) to learn the problem the PR is meant to solve. Read the diff and the relevant code and confirm the PR actually solves THAT problem. If it does NOT clearly fix the described problem \u2192 add_review_note(blocking=true) explaining the gap.
+## Step 1 \u2014 Fix verification (section: "fix")
+Use get_pr_description (and get_pr_commits if the description is thin) to learn the problem the PR should solve. Read the diff and the relevant code and judge whether the PR actually solves THAT problem.
+- Solves it \u2192 status "ok", headline "fix confirmed", a one-line detail of what it fixes.
+- Does NOT solve it \u2192 status "blocking", headline e.g. "does not fix the described problem", detail explaining the gap.
+- Description too vague to tell what is being fixed \u2192 status "suggestion", headline "not enough info in the description", detail: there isn't enough information in the PR description to understand what is being fixed and how \u2014 ask the author to clarify.
 
-2. Compare with how you would fix it. Think how you would solve the same problem. ONLY if your approach is SUBSTANTIALLY better (clearly simpler, safer, or more correct \u2014 not mere style or preference) \u2192 add_review_note(blocking=false) briefly describing it. If the PR's approach is reasonable, say nothing.
+## Step 2 \u2014 Alternative approach (section: "alternative") \u2014 OPTIONAL
+Only if YOUR approach would be SUBSTANTIALLY better (clearly simpler, safer, or more correct \u2014 not style/preference): status "suggestion", a short headline, detail briefly describing the better approach. If the PR's approach is reasonable, do NOT call add_review_note for this step at all.
 
-3. Critical line-level review. Apply the project conventions; for genuinely [critical] issues post create_inline_comment. These block the merge.
+## Step 3 \u2014 Critical line-level review
+Apply the project conventions; for genuinely [critical] issues call create_inline_comment (these block the merge). Do NOT add_review_note for this \u2014 the critical-review section is generated automatically from your inline comments.
 
-4. Verify CI. Use get_pr_checks and compare the actual checks against the expected CI check set in the project conventions (match by name prefix; ignore version/edition suffixes). If any expected check FAILED or is entirely MISSING \u2192 add_review_note(blocking=true). If checks are still pending/running \u2192 add_review_note(blocking=false) noting it. (Detailed failure analysis is another bot's job \u2014 here just check presence and pass/fail.)
+### Severity filter \u2014 STRICT
+- Post ONLY [critical] issues (crash/outage/data loss/security breach).
+- NEVER [major]/[minor] unless the conventions say otherwise. When in doubt \u2014 skip.
 
-5. Verify test coverage. Confirm the PR adds or updates a test that covers the problem described in step 1. If no such test is present \u2192 add_review_note(blocking=false).
+## Step 4 \u2014 CI checks (section: "ci")
+Use get_pr_checks and compare against the expected CI check set in the project conventions (match by name prefix; ignore version/edition suffixes).
+- A required check FAILED or is entirely MISSING / no runs at all \u2192 status "blocking", headline e.g. "no runs found" or "Static Tests failed". The detail MUST be a markdown LIST of the expected checks that are missing or failed (one per line, "- Name"), not prose.
+- Checks still pending/running \u2192 status "suggestion", headline "still running".
+- All required checks passed \u2192 status "ok", headline "all required checks passed".
+(Detailed failure analysis is another bot's job \u2014 here just presence and pass/fail.)
 
-## Severity filter (line-level) \u2014 STRICT
-- Post ONLY comments labelled [critical] (blocks merge: crash/outage/data loss/security breach).
-- NEVER post [major] or [minor] comments unless the project conventions explicitly say otherwise.
-- When in doubt whether something is critical or major \u2014 skip it.
+## Step 5 \u2014 Test coverage (section: "coverage")
+Check whether the PR adds or updates a test covering the problem from step 1.
+- Missing \u2192 status "suggestion", headline e.g. "No tests added for <Class>", detail: a SHORT, HIGH-LEVEL recommendation. Recommend only top-level scenarios to cover (integration/functional level at minimum) \u2014 do NOT prescribe unit tests, do NOT enumerate detailed cases or assertions. Keep it to a few bullets and let the developer decide how.
+- Present \u2192 status "ok", headline "covered by tests".
 
 ## Blocking vs non-blocking
-Only these block the merge: the PR not fixing the described problem (step 1), a failed or missing required check (step 4), and [critical] inline issues (step 3). Everything else \u2014 a better-approach suggestion (2), a missing test (5), pending CI \u2014 is a non-blocking note.
+Only these block the merge (REQUEST_CHANGES): the PR not fixing the described problem (step 1, blocking), a failed/missing required check (step 4, blocking), and [critical] inline issues (step 3). Suggestions and "ok" results never block.
 `.trim();
 
 // ../services/reviewer/dist/knowledge/index.js
@@ -4828,15 +4841,17 @@ Recurring risky patterns specific to this codebase that are worth flagging when 
   {
     toolSpec: {
       name: "add_review_note",
-      description: `Record a PR-level (general) finding for the final review summary \u2014 NOT tied to a specific line. Use for the review-plan checks: the PR not actually fixing the described problem, a substantially better alternative approach, tests not having passed, or a missing test covering the fix. Set blocking=true ONLY for "the PR does not fix the described problem" or "tests did not pass"; everything else is a non-blocking suggestion.`,
+      description: `Record a PR-level finding for one step of the review plan (NOT tied to a code line). Each call becomes one collapsible section in the final review. Call it once per applicable step (fix / ci / coverage always; alternative only when relevant).`,
       inputSchema: {
         json: {
           type: "object",
           properties: {
-            note: { type: "string", description: "The finding, in GitHub markdown. Be concise." },
-            blocking: { type: "boolean", description: 'true only for "problem not fixed" or "tests not passed"; false otherwise.' }
+            section: { type: "string", enum: ["fix", "alternative", "ci", "coverage"], description: "Which review-plan step this is." },
+            status: { type: "string", enum: ["ok", "suggestion", "blocking"], description: "ok = fine (\u2705); suggestion = non-blocking advice (\u{1F4A1}); blocking = must fix before merge (\u{1F534})." },
+            headline: { type: "string", description: 'Short status shown on the collapsed header line, e.g. "no runs found", "No tests added for FeedMigrator", "fix confirmed".' },
+            detail: { type: "string", description: "The collapsed body (markdown). For ci, a markdown LIST of the missing/failed checks. Keep it minimal." }
           },
-          required: ["note", "blocking"]
+          required: ["section", "status", "headline", "detail"]
         }
       }
     }
@@ -5009,8 +5024,13 @@ ${memory}`);
       return annotated;
     }
     case "add_review_note": {
-      ctx.reviewNotes.push({ note: String(input.note ?? "").trim(), blocking: !!input.blocking });
-      return `Noted (${input.blocking ? "blocking" : "non-blocking"}).`;
+      ctx.reviewNotes.push({
+        section: String(input.section ?? "fix"),
+        status: String(input.status ?? "suggestion"),
+        headline: String(input.headline ?? "").trim(),
+        detail: String(input.detail ?? "").trim()
+      });
+      return `Noted (${input.section}: ${input.status}).`;
     }
     case "read_file": {
       try {
@@ -5170,22 +5190,39 @@ Specific request from ${event.requestedBy}: ${event.instructions}` : `Review PR 
         getPrChecksTool(toolCtx)
       ]
     });
-    const blockingNotes = ctx.reviewNotes.filter((n) => n.blocking);
-    const hasBlocking = ctx.commentsPosted > 0 || blockingNotes.length > 0;
-    const reviewEvent = hasBlocking ? "REQUEST_CHANGES" : ctx.reviewNotes.length > 0 ? "COMMENT" : "APPROVE";
-    let reviewBody;
-    if (reviewEvent === "APPROVE") {
-      reviewBody = "Looks good to me \u{1F44D}";
-    } else {
-      const parts = [];
-      if (ctx.commentsPosted > 0) {
-        parts.push(`Found ${ctx.commentsPosted} critical inline issue${ctx.commentsPosted > 1 ? "s" : ""} \u2014 see the comments below.`);
-      }
-      for (const n of ctx.reviewNotes) {
-        parts.push(`${n.blocking ? "\u{1F534}" : "\u{1F4A1}"} ${n.note}`);
-      }
-      reviewBody = parts.join("\n\n");
+    const ICON = { ok: "\u2705", suggestion: "\u{1F4A1}", blocking: "\u{1F534}" };
+    const TITLE = { fix: "Fix verification", alternative: "Alternative approach", ci: "CI checks", coverage: "Test coverage" };
+    const section = (icon, title, headline, detail) => `<details>
+<summary>${icon} ${title}: ${headline}</summary>
+
+${detail}
+
+</details>`;
+    const notesOf = (s) => ctx.reviewNotes.filter((n) => n.section === s);
+    const parts = [];
+    for (const s of ["fix", "alternative"]) {
+      for (const n of notesOf(s))
+        parts.push(section(ICON[n.status] ?? "\u{1F4A1}", TITLE[s], n.headline, n.detail));
     }
+    if (ctx.commentsPosted > 0) {
+      const n = ctx.commentsPosted;
+      parts.push(section("\u{1F534}", "Critical review", `${n} issue${n > 1 ? "s" : ""}`, `Found ${n} critical inline issue${n > 1 ? "s" : ""} \u2014 see the comments below.`));
+    }
+    for (const s of ["ci", "coverage"]) {
+      for (const n of notesOf(s))
+        parts.push(section(ICON[n.status] ?? "\u{1F4A1}", TITLE[s], n.headline, n.detail));
+    }
+    const hasBlocking = ctx.commentsPosted > 0 || ctx.reviewNotes.some((n) => n.status === "blocking");
+    const hasSuggestion = ctx.reviewNotes.some((n) => n.status === "suggestion");
+    const reviewEvent = hasBlocking ? "REQUEST_CHANGES" : hasSuggestion ? "COMMENT" : "APPROVE";
+    const TITLE_LINE = {
+      APPROVE: "## \u2705 Review complete \u2014 approved",
+      COMMENT: "## \u{1F4DD} Review complete \u2014 no blockers, see notes",
+      REQUEST_CHANGES: "## \u{1F534} Review complete \u2014 changes requested"
+    };
+    const reviewBody = `${TITLE_LINE[reviewEvent]}
+
+${parts.length > 0 ? parts.join("\n\n") : "Looks good to me \u{1F44D}"}`;
     const reviewRes = await fetch(`https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/reviews`, {
       method: "POST",
       headers: {
