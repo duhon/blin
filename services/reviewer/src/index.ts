@@ -184,7 +184,7 @@ const TOOLS = [
   {
     toolSpec: {
       name: 'save_repo_memory',
-      description: `Persist accumulated knowledge about this repository to S3 for future reviews. Call this at the end of every review. Merge new facts with existing memory — never discard what was already there, only add or correct.
+      description: `Persist accumulated knowledge about this repository to S3 for future reviews (used when learning from a closed PR). Merge new facts with existing memory — never discard what was already there, only add or correct.
 
 STRICT FORMAT — output exactly these four sections, no others:
 
@@ -300,12 +300,11 @@ You have tools to explore the PR, post inline comments, and record general findi
 - read_file: read a slice of any file in the repo for full context. Paginate with offset+limit when the footer says more lines exist — do NOT re-read the same file/range expecting different output
 - create_inline_comment: post a comment on a specific line (for [critical] line-level issues)
 - add_review_note: record a PR-level finding for the final review summary
-- save_repo_memory: persist knowledge about this repo to S3 for future reviews
 
 How to run a review:
 1. ALWAYS call get_project_conventions FIRST. It returns the "Review plan" you must follow step by step, plus the project conventions and the expected CI checks. Follow that plan — do not invent your own.
 2. Work the plan: use add_review_note for PR-level findings (set blocking only as the plan dictates) and create_inline_comment for [critical] line-level issues.
-3. When finished, call save_repo_memory last (merge with existing memory — never discard), then say "Review complete." and stop calling tools.
+3. When finished, say "Review complete." and stop calling tools.
 
 Rules for inline comments:
 - The diff from get_pr_diff annotates every line with its exact line number: \`+[RIGHT:42]\` means added line 42 (use side=RIGHT, line=42), \`-[LEFT:41]\` means removed line 41 (use side=LEFT, line=41), \` [RIGHT:42]\` means context line 42 (use side=RIGHT, line=42)
@@ -649,7 +648,8 @@ export function register(bus: IEventBus, githubApp: App): void {
       instructions: SYSTEM_PROMPT,
       request: userRequest,
       tools: [
-        ...toAgentTools(TOOLS, (name, input) => executeTool(name, input, ctx)),
+        // save_repo_memory is excluded here — learning happens only on PR close.
+        ...toAgentTools(TOOLS.filter((t) => t.toolSpec.name !== 'save_repo_memory'), (name, input) => executeTool(name, input, ctx)),
         getPrDescriptionTool(toolCtx),
         listPrFilesTool(toolCtx),
         getPrCommitsTool(toolCtx),
