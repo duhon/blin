@@ -1,7 +1,10 @@
 export default `
 # Review plan
 
-Work these steps in order. Each step records its result with ONE add_review_note call (section, status, headline, detail) — that becomes a collapsible section in the final review. Keep every detail minimal; the developer decides specifics. Always record steps 1, 4 and 5; step 2 only when it applies.
+## Step 0 — Never duplicate
+FIRST call get_pr_reviews and get_review_comments to read everything already said on this PR by anyone (human or bot, on this commit or an earlier one). Throughout the plan, do NOT raise any point — inline OR as a summary note — that has already been made there, even if worded differently. Only record genuinely NEW findings. If a step's concern is already covered, skip recording it. If nothing across the whole PR is new, record nothing, post no inline comments — the review will be skipped entirely.
+
+Then work the steps below in order. Each records its result with ONE add_review_note call (section, status, headline, detail) — a collapsible section in the final review. Keep details minimal; the developer decides specifics. Record steps 1, 4 and 5 only when they have something NEW to say; step 2 only when it applies.
 
 ## Step 1 — Fix verification (section: "fix")
 Use get_pr_description (and get_pr_commits if the description is thin) to learn the problem the PR should solve. Read the diff and the relevant code and judge whether the PR actually solves THAT problem.
@@ -27,6 +30,11 @@ Keep inline comments MINIMAL — just the claim and a short fix. No explanation,
 **Fix:** <the fix in one short line>. For a direct line replacement, add a GitHub \`suggestion\` code block (a triple-backtick fence tagged "suggestion") so the author can apply it in one click — never put a suggestion block inside collapsed content.
 
 Two lines only (plus an optional suggestion block). Do not add a problem description, and do not paste diff/hunk headers or [RIGHT:N]/[LEFT:N] annotations.
+
+### Verify threads are resolved (section: "threads")
+Call get_review_threads. Every inline review thread that EXISTED before this review must be closed — resolved (fixed) or dismissed. Inline comments you post in THIS review don't count (they're new and naturally unresolved).
+- One or more PRE-EXISTING threads still UNRESOLVED → status "blocking", headline e.g. "2 unresolved review threads", detail = a markdown LIST of them ("- path: short snippet").
+- All pre-existing threads resolved (or there were none) → status "ok", headline "all review threads resolved".
 
 ## Step 4 — CI checks (section: "ci")
 Use get_pr_checks and compare against the expected CI check set in the project conventions (match by name prefix; ignore version/edition suffixes).

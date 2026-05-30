@@ -192,6 +192,33 @@ export function getReviewCommentsTool(ctx: GitHubToolContext): AgentTool {
   };
 }
 
+/** All inline review threads on the PR with their resolution status (needs GraphQL). */
+export function getReviewThreadsTool(ctx: GitHubToolContext): AgentTool {
+  return {
+    name: 'get_review_threads',
+    description: 'All inline review threads on the PR with their resolution status (resolved vs unresolved). Use to verify open threads have been closed (resolved or dismissed) before merge.',
+    inputSchema: { type: 'object', properties: {} },
+    async run(): Promise<string> {
+      const query = `query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved isOutdated path comments(first:1){nodes{author{login} body}}}}}}}`;
+      try {
+        const data: any = await ctx.octokit.graphql(query, { owner: ctx.owner, repo: ctx.repo, number: ctx.prNumber });
+        const threads: any[] = data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+        if (!threads.length) return 'No review threads on this PR.';
+        const unresolved = threads.filter((t) => !t.isResolved);
+        const lines = threads.map((t) => {
+          const c = t.comments?.nodes?.[0];
+          const who = c?.author?.login ? `@${c.author.login}: ` : '';
+          const snippet = c?.body ? String(c.body).replace(/\s+/g, ' ').slice(0, 80) : '';
+          return `${t.isResolved ? 'resolved' : 'UNRESOLVED'} — ${t.path}${t.isOutdated ? ' (outdated)' : ''}: ${who}${snippet}`;
+        });
+        return `${threads.length} thread(s), ${unresolved.length} unresolved:\n${lines.join('\n')}`;
+      } catch (e: any) {
+        return `Could not fetch review threads: ${e?.message ?? e}`;
+      }
+    },
+  };
+}
+
 /** Read a slice of a file at the context ref, returned with line numbers. */
 export function readFileTool(ctx: GitHubToolContext, opts: ReadFileOptions = {}): AgentTool {
   const defaultLimit = opts.defaultLimit ?? DEFAULT_READ_LIMIT;

@@ -2,7 +2,7 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3
 import type { IEventBus, ReviewRequestedEvent, ReviewThreadReplyEvent, PrClosedEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
 import { BedrockAgent, type AgentTool } from '@blin/agent';
-import { getPrDescriptionTool, listPrFilesTool, getPrCommitsTool, getPrChecksTool, getPrReviewsTool, getReviewCommentsTool, type GitHubToolContext } from '@blin/github-tools';
+import { getPrDescriptionTool, listPrFilesTool, getPrCommitsTool, getPrChecksTool, getPrReviewsTool, getReviewCommentsTool, getReviewThreadsTool, type GitHubToolContext } from '@blin/github-tools';
 import { knowledgePacks } from './knowledge/index.js';
 
 const s3 = new S3Client({});
@@ -246,7 +246,7 @@ Recurring risky patterns specific to this codebase that are worth flagging when 
         json: {
           type: 'object',
           properties: {
-            section: { type: 'string', enum: ['fix', 'alternative', 'ci', 'coverage'], description: 'Which review-plan step this is.' },
+            section: { type: 'string', enum: ['fix', 'alternative', 'threads', 'ci', 'coverage'], description: 'Which review-plan step this is.' },
             status: { type: 'string', enum: ['ok', 'suggestion', 'blocking'], description: 'ok = fine (✅); suggestion = non-blocking advice (💡); blocking = must fix before merge (🔴).' },
             headline: { type: 'string', description: 'Short status shown on the collapsed header line, e.g. "no runs found", "No tests added for FeedMigrator", "fix confirmed".' },
             detail: { type: 'string', description: 'The collapsed body (markdown). For ci, a markdown LIST of the missing/failed checks. Keep it minimal.' },
@@ -297,9 +297,14 @@ You have tools to explore the PR, post inline comments, and record general findi
 - get_pr_diff: see what changed
 - list_pr_files: see all changed files
 - get_pr_checks: CI check statuses for the PR — whether tests ran and passed
+- get_pr_reviews: reviews already submitted on this PR (any author) and their verdicts
+- get_review_comments: inline-comment threads already on this PR (any author)
+- get_review_threads: inline review threads with their resolution status (resolved / unresolved)
 - read_file: read a slice of any file in the repo for full context. Paginate with offset+limit when the footer says more lines exist — do NOT re-read the same file/range expecting different output
 - create_inline_comment: post a comment on a specific line (for [critical] line-level issues)
 - add_review_note: record a PR-level finding for the final review summary
+
+NEVER DUPLICATE: before recording anything, call get_pr_reviews and get_review_comments to see what has already been said on this PR by anyone (human or bot, on this or an earlier commit). Do NOT raise a point — inline or in the summary — that has already been raised. Only record genuinely NEW findings. If there is nothing new to add, record nothing and submit no comments.
 
 How to run a review:
 1. ALWAYS call get_project_conventions FIRST. It returns the "Review plan" you must follow step by step, plus the project conventions and the expected CI checks. Follow that plan — do not invent your own.
@@ -654,6 +659,9 @@ export function register(bus: IEventBus, githubApp: App): void {
         listPrFilesTool(toolCtx),
         getPrCommitsTool(toolCtx),
         getPrChecksTool(toolCtx),
+        getPrReviewsTool(toolCtx),
+        getReviewCommentsTool(toolCtx),
+        getReviewThreadsTool(toolCtx),
       ],
     });
 
@@ -662,7 +670,7 @@ export function register(bus: IEventBus, githubApp: App): void {
     // REQUEST_CHANGES on any blocking section or critical inline issues;
     // COMMENT if there are only suggestions; APPROVE if everything is ok.
     const ICON: Record<string, string> = { ok: '✅', suggestion: '💡', blocking: '🔴' };
-    const TITLE: Record<string, string> = { fix: 'Fix verification', alternative: 'Alternative approach', ci: 'CI checks', coverage: 'Test coverage' };
+    const TITLE: Record<string, string> = { fix: 'Fix verification', alternative: 'Alternative approach', threads: 'Review threads', ci: 'CI checks', coverage: 'Test coverage' };
     const section = (icon: string, title: string, headline: string, detail: string) =>
       `<details>\n<summary>${icon} ${title}: ${headline}</summary>\n\n${detail}\n\n</details>`;
 
@@ -675,8 +683,15 @@ export function register(bus: IEventBus, githubApp: App): void {
       const n = ctx.commentsPosted;
       parts.push(section('🔴', 'Critical review', `${n} issue${n > 1 ? 's' : ''}`, `Found ${n} critical inline issue${n > 1 ? 's' : ''} — see the comments below.`));
     }
-    for (const s of ['ci', 'coverage']) {
+    for (const s of ['threads', 'ci', 'coverage']) {
       for (const n of notesOf(s)) parts.push(section(ICON[n.status] ?? '💡', TITLE[s], n.headline, n.detail));
+    }
+
+    // Nothing new to say (everything was already raised on the PR) — don't post
+    // a duplicate review.
+    if (parts.length === 0) {
+      console.log(`[reviewer] PR #${event.pr.number}: nothing new to add, skipping review submission`);
+      return;
     }
 
     // Only APPROVE / REQUEST_CHANGES resolve a requested review — a COMMENT

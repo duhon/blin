@@ -4393,6 +4393,33 @@ ${convo}`;
     }
   };
 }
+function getReviewThreadsTool(ctx) {
+  return {
+    name: "get_review_threads",
+    description: "All inline review threads on the PR with their resolution status (resolved vs unresolved). Use to verify open threads have been closed (resolved or dismissed) before merge.",
+    inputSchema: { type: "object", properties: {} },
+    async run() {
+      const query = `query($owner:String!,$repo:String!,$number:Int!){repository(owner:$owner,name:$repo){pullRequest(number:$number){reviewThreads(first:100){nodes{isResolved isOutdated path comments(first:1){nodes{author{login} body}}}}}}}`;
+      try {
+        const data = await ctx.octokit.graphql(query, { owner: ctx.owner, repo: ctx.repo, number: ctx.prNumber });
+        const threads = data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
+        if (!threads.length)
+          return "No review threads on this PR.";
+        const unresolved = threads.filter((t) => !t.isResolved);
+        const lines = threads.map((t) => {
+          const c = t.comments?.nodes?.[0];
+          const who = c?.author?.login ? `@${c.author.login}: ` : "";
+          const snippet = c?.body ? String(c.body).replace(/\s+/g, " ").slice(0, 80) : "";
+          return `${t.isResolved ? "resolved" : "UNRESOLVED"} \u2014 ${t.path}${t.isOutdated ? " (outdated)" : ""}: ${who}${snippet}`;
+        });
+        return `${threads.length} thread(s), ${unresolved.length} unresolved:
+${lines.join("\n")}`;
+      } catch (e) {
+        return `Could not fetch review threads: ${e?.message ?? e}`;
+      }
+    }
+  };
+}
 function readFileTool(ctx, opts = {}) {
   const defaultLimit = opts.defaultLimit ?? DEFAULT_READ_LIMIT;
   const maxLimit = opts.maxLimit ?? MAX_READ_LIMIT;
@@ -4642,7 +4669,10 @@ A Magento PR is expected to run this set of checks. When verifying CI (review-pl
 var review_plan_default = `
 # Review plan
 
-Work these steps in order. Each step records its result with ONE add_review_note call (section, status, headline, detail) \u2014 that becomes a collapsible section in the final review. Keep every detail minimal; the developer decides specifics. Always record steps 1, 4 and 5; step 2 only when it applies.
+## Step 0 \u2014 Never duplicate
+FIRST call get_pr_reviews and get_review_comments to read everything already said on this PR by anyone (human or bot, on this commit or an earlier one). Throughout the plan, do NOT raise any point \u2014 inline OR as a summary note \u2014 that has already been made there, even if worded differently. Only record genuinely NEW findings. If a step's concern is already covered, skip recording it. If nothing across the whole PR is new, record nothing, post no inline comments \u2014 the review will be skipped entirely.
+
+Then work the steps below in order. Each records its result with ONE add_review_note call (section, status, headline, detail) \u2014 a collapsible section in the final review. Keep details minimal; the developer decides specifics. Record steps 1, 4 and 5 only when they have something NEW to say; step 2 only when it applies.
 
 ## Step 1 \u2014 Fix verification (section: "fix")
 Use get_pr_description (and get_pr_commits if the description is thin) to learn the problem the PR should solve. Read the diff and the relevant code and judge whether the PR actually solves THAT problem.
@@ -4668,6 +4698,11 @@ Keep inline comments MINIMAL \u2014 just the claim and a short fix. No explanati
 **Fix:** <the fix in one short line>. For a direct line replacement, add a GitHub \`suggestion\` code block (a triple-backtick fence tagged "suggestion") so the author can apply it in one click \u2014 never put a suggestion block inside collapsed content.
 
 Two lines only (plus an optional suggestion block). Do not add a problem description, and do not paste diff/hunk headers or [RIGHT:N]/[LEFT:N] annotations.
+
+### Verify threads are resolved (section: "threads")
+Call get_review_threads. Every inline review thread that EXISTED before this review must be closed \u2014 resolved (fixed) or dismissed. Inline comments you post in THIS review don't count (they're new and naturally unresolved).
+- One or more PRE-EXISTING threads still UNRESOLVED \u2192 status "blocking", headline e.g. "2 unresolved review threads", detail = a markdown LIST of them ("- path: short snippet").
+- All pre-existing threads resolved (or there were none) \u2192 status "ok", headline "all review threads resolved".
 
 ## Step 4 \u2014 CI checks (section: "ci")
 Use get_pr_checks and compare against the expected CI check set in the project conventions (match by name prefix; ignore version/edition suffixes).
@@ -4919,7 +4954,7 @@ Recurring risky patterns specific to this codebase that are worth flagging when 
         json: {
           type: "object",
           properties: {
-            section: { type: "string", enum: ["fix", "alternative", "ci", "coverage"], description: "Which review-plan step this is." },
+            section: { type: "string", enum: ["fix", "alternative", "threads", "ci", "coverage"], description: "Which review-plan step this is." },
             status: { type: "string", enum: ["ok", "suggestion", "blocking"], description: "ok = fine (\u2705); suggestion = non-blocking advice (\u{1F4A1}); blocking = must fix before merge (\u{1F534})." },
             headline: { type: "string", description: 'Short status shown on the collapsed header line, e.g. "no runs found", "No tests added for FeedMigrator", "fix confirmed".' },
             detail: { type: "string", description: "The collapsed body (markdown). For ci, a markdown LIST of the missing/failed checks. Keep it minimal." }
@@ -4969,9 +5004,14 @@ You have tools to explore the PR, post inline comments, and record general findi
 - get_pr_diff: see what changed
 - list_pr_files: see all changed files
 - get_pr_checks: CI check statuses for the PR \u2014 whether tests ran and passed
+- get_pr_reviews: reviews already submitted on this PR (any author) and their verdicts
+- get_review_comments: inline-comment threads already on this PR (any author)
+- get_review_threads: inline review threads with their resolution status (resolved / unresolved)
 - read_file: read a slice of any file in the repo for full context. Paginate with offset+limit when the footer says more lines exist \u2014 do NOT re-read the same file/range expecting different output
 - create_inline_comment: post a comment on a specific line (for [critical] line-level issues)
 - add_review_note: record a PR-level finding for the final review summary
+
+NEVER DUPLICATE: before recording anything, call get_pr_reviews and get_review_comments to see what has already been said on this PR by anyone (human or bot, on this or an earlier commit). Do NOT raise a point \u2014 inline or in the summary \u2014 that has already been raised. Only record genuinely NEW findings. If there is nothing new to add, record nothing and submit no comments.
 
 How to run a review:
 1. ALWAYS call get_project_conventions FIRST. It returns the "Review plan" you must follow step by step, plus the project conventions and the expected CI checks. Follow that plan \u2014 do not invent your own.
@@ -5277,11 +5317,14 @@ Specific request from ${event.requestedBy}: ${event.instructions}` : `Review PR 
         getPrDescriptionTool(toolCtx),
         listPrFilesTool(toolCtx),
         getPrCommitsTool(toolCtx),
-        getPrChecksTool(toolCtx)
+        getPrChecksTool(toolCtx),
+        getPrReviewsTool(toolCtx),
+        getReviewCommentsTool(toolCtx),
+        getReviewThreadsTool(toolCtx)
       ]
     });
     const ICON = { ok: "\u2705", suggestion: "\u{1F4A1}", blocking: "\u{1F534}" };
-    const TITLE = { fix: "Fix verification", alternative: "Alternative approach", ci: "CI checks", coverage: "Test coverage" };
+    const TITLE = { fix: "Fix verification", alternative: "Alternative approach", threads: "Review threads", ci: "CI checks", coverage: "Test coverage" };
     const section = (icon, title, headline, detail) => `<details>
 <summary>${icon} ${title}: ${headline}</summary>
 
@@ -5298,9 +5341,13 @@ ${detail}
       const n = ctx.commentsPosted;
       parts.push(section("\u{1F534}", "Critical review", `${n} issue${n > 1 ? "s" : ""}`, `Found ${n} critical inline issue${n > 1 ? "s" : ""} \u2014 see the comments below.`));
     }
-    for (const s of ["ci", "coverage"]) {
+    for (const s of ["threads", "ci", "coverage"]) {
       for (const n of notesOf(s))
         parts.push(section(ICON[n.status] ?? "\u{1F4A1}", TITLE[s], n.headline, n.detail));
+    }
+    if (parts.length === 0) {
+      console.log(`[reviewer] PR #${event.pr.number}: nothing new to add, skipping review submission`);
+      return;
     }
     const hasBlocking = ctx.commentsPosted > 0 || ctx.reviewNotes.some((n) => n.status === "blocking");
     const reviewEvent = hasBlocking ? "REQUEST_CHANGES" : "APPROVE";
