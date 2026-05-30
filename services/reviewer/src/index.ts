@@ -2,7 +2,7 @@ import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3
 import type { IEventBus, ReviewRequestedEvent, ReviewThreadReplyEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
 import { BedrockAgent, type AgentTool } from '@blin/agent';
-import { getPrDescriptionTool, listPrFilesTool, getPrCommitsTool, type GitHubToolContext } from '@blin/github-tools';
+import { getPrDescriptionTool, listPrFilesTool, getPrCommitsTool, getPrChecksTool, type GitHubToolContext } from '@blin/github-tools';
 import { knowledgePacks } from './knowledge/index.js';
 
 const s3 = new S3Client({});
@@ -13,7 +13,10 @@ const DEFAULT_READ_LIMIT = 200;
 const MAX_READ_LIMIT = 1000;
 
 const DEFAULT_CONFIG = {
-  knowledge: ['basic'] as string[],
+  // blin targets Magento repos, so the Magento pack (incl. the expected CI check
+  // set used by review-plan step 4) loads by default. A repo can override via
+  // .github/blin.yml → knowledge: [ ... ].
+  knowledge: ['basic', 'magento'] as string[],
   context_files: [] as string[],
 };
 
@@ -236,6 +239,22 @@ Recurring risky patterns specific to this codebase that are worth flagging when 
   },
   {
     toolSpec: {
+      name: 'add_review_note',
+      description: `Record a PR-level (general) finding for the final review summary — NOT tied to a specific line. Use for the review-plan checks: the PR not actually fixing the described problem, a substantially better alternative approach, tests not having passed, or a missing test covering the fix. Set blocking=true ONLY for "the PR does not fix the described problem" or "tests did not pass"; everything else is a non-blocking suggestion.`,
+      inputSchema: {
+        json: {
+          type: 'object',
+          properties: {
+            note: { type: 'string', description: 'The finding, in GitHub markdown. Be concise.' },
+            blocking: { type: 'boolean', description: 'true only for "problem not fixed" or "tests not passed"; false otherwise.' },
+          },
+          required: ['note', 'blocking'],
+        },
+      },
+    },
+  },
+  {
+    toolSpec: {
       name: 'create_inline_comment',
       description: 'Post an inline review comment on a line or range of lines in the PR diff. Lines must be visible in the diff hunk (including unchanged context lines shown around changes). Use start_line+line to highlight a multi-line range.',
       inputSchema: {
@@ -268,23 +287,34 @@ Recurring risky patterns specific to this codebase that are worth flagging when 
 
 const SYSTEM_PROMPT = `You are a senior engineer doing a thorough code review of a pull request.
 
-You have tools to explore the PR and post inline comments:
+You have tools to explore the PR, post inline comments, and record general findings:
 - get_pr_description: understand the purpose of the PR
 - get_pr_commits: the PR's commit messages — extra intent when the description is thin
 - get_pr_diff: see what changed
 - list_pr_files: see all changed files
+- get_pr_checks: CI check statuses for the PR — whether tests ran and passed
 - read_file: read a slice of any file in the repo for full context. Paginate with offset+limit when the footer says more lines exist — do NOT re-read the same file/range expecting different output
-- create_inline_comment: post a comment on a specific line
+- create_inline_comment: post a comment on a specific line (for [critical] line-level issues)
+- add_review_note: record a PR-level finding for the final review summary (steps 1, 2, 4, 5 below)
 - save_repo_memory: persist knowledge about this repo to S3 for future reviews
 
-Your review process:
-1. get_project_conventions — always start here; includes memory from previous reviews of this repo
-2. get_pr_description — understand the purpose of the PR (get_pr_commits if the description is thin)
-3. get_pr_diff — see what changed
-4. read_file as needed — get context from related files, types, interfaces
-5. create_inline_comment — post comments for real issues found
-6. Use \`\`\`suggestion blocks when you have a concrete fix
-7. save_repo_memory — always call last; update memory with anything new learned about this repo
+Your review plan — follow these steps in order:
+
+0. get_project_conventions — always start here; includes memory from previous reviews of this repo.
+
+1. Understand & verify the fix. get_pr_description (get_pr_commits if the description is thin) to learn the problem the PR is meant to solve. Read the diff and relevant code and confirm the PR actually solves THAT problem. If it does NOT clearly fix the described problem → add_review_note(blocking=true) explaining the gap.
+
+2. Compare with how you would fix it. Think how you would solve the same problem. ONLY if your approach is SUBSTANTIALLY better (clearly simpler, safer, or more correct — not mere style or preference) → add_review_note(blocking=false) briefly describing the better approach. If the PR's approach is reasonable, say nothing.
+
+3. Critical line-level review. Apply the project conventions; for genuinely [critical] issues post create_inline_comment (see the strict severity filter and inline rules below). These block the merge.
+
+4. Verify CI. get_pr_checks, and compare the actual checks against the expected Magento check set listed in the project conventions (match by name prefix; ignore version/edition suffixes). If any expected check FAILED or is entirely MISSING → add_review_note(blocking=true). If checks are still pending/running → add_review_note(blocking=false) noting it. (Detailed failure analysis is another bot's job — here just check presence and pass/fail.)
+
+5. Verify test coverage. Confirm the PR adds or updates a test that covers the problem described in step 1. If no such test is present → add_review_note(blocking=false).
+
+6. save_repo_memory — always call last; update memory with anything new learned about this repo.
+
+Blocking vs non-blocking: only "the PR does not fix the described problem" (1), failed tests (4), and [critical] inline issues (3) block the merge. Everything else (better-approach suggestion, missing test, pending CI) is a non-blocking note.
 
 Severity filter — STRICT RULE:
 - Post ONLY comments labelled [critical] (blocks merge, will cause crash/outage/data loss/security breach)
@@ -313,6 +343,8 @@ interface ReviewContext {
   pr: { title: string; body: string | null; base: string; head: string };
   diffMap: DiffMap | null;
   commentsPosted: number;
+  /** General (PR-level) findings from the review plan, assembled into the final review body. */
+  reviewNotes: Array<{ note: string; blocking: boolean }>;
 }
 
 async function loadDiffMap(ctx: ReviewContext): Promise<{ annotated: string; map: DiffMap }> {
@@ -419,6 +451,11 @@ async function executeTool(name: string, input: any, ctx: ReviewContext): Promis
     case 'get_pr_diff': {
       const { annotated } = await loadDiffMap(ctx);
       return annotated;
+    }
+
+    case 'add_review_note': {
+      ctx.reviewNotes.push({ note: String(input.note ?? '').trim(), blocking: !!input.blocking });
+      return `Noted (${input.blocking ? 'blocking' : 'non-blocking'}).`;
     }
 
     case 'read_file': {
@@ -578,6 +615,7 @@ export function register(bus: IEventBus, githubApp: App): void {
       },
       diffMap: null,
       commentsPosted: 0,
+      reviewNotes: [],
     };
 
     const userRequest = event.instructions
@@ -604,13 +642,30 @@ export function register(bus: IEventBus, githubApp: App): void {
         getPrDescriptionTool(toolCtx),
         listPrFilesTool(toolCtx),
         getPrCommitsTool(toolCtx),
+        getPrChecksTool(toolCtx),
       ],
     });
 
-    const reviewEvent = ctx.commentsPosted === 0 ? 'APPROVE' : 'REQUEST_CHANGES';
-    const reviewBody = ctx.commentsPosted === 0
-      ? `Looks good to me 👍`
-      : `Found ${ctx.commentsPosted} critical issue${ctx.commentsPosted > 1 ? 's' : ''}. Please address the inline comments.`;
+    // Decide the verdict: REQUEST_CHANGES if there are critical inline issues
+    // or any blocking note (problem-not-fixed / tests-failed); COMMENT if there
+    // are only non-blocking notes; APPROVE if nothing to flag.
+    const blockingNotes = ctx.reviewNotes.filter((n) => n.blocking);
+    const hasBlocking = ctx.commentsPosted > 0 || blockingNotes.length > 0;
+    const reviewEvent = hasBlocking ? 'REQUEST_CHANGES' : (ctx.reviewNotes.length > 0 ? 'COMMENT' : 'APPROVE');
+
+    let reviewBody: string;
+    if (reviewEvent === 'APPROVE') {
+      reviewBody = 'Looks good to me 👍';
+    } else {
+      const parts: string[] = [];
+      if (ctx.commentsPosted > 0) {
+        parts.push(`Found ${ctx.commentsPosted} critical inline issue${ctx.commentsPosted > 1 ? 's' : ''} — see the comments below.`);
+      }
+      for (const n of ctx.reviewNotes) {
+        parts.push(`${n.blocking ? '🔴' : '💡'} ${n.note}`);
+      }
+      reviewBody = parts.join('\n\n');
+    }
 
     const reviewRes = await fetch(
       `https://api.github.com/repos/${event.repo.owner}/${event.repo.name}/pulls/${event.pr.number}/reviews`,
@@ -702,6 +757,7 @@ Be concise. If their argument is valid, acknowledge it and explain if you're ret
       },
       diffMap: null,
       commentsPosted: 0,
+      reviewNotes: [],
     };
 
     const threadExecuteTool = async (name: string, input: any): Promise<string> => {

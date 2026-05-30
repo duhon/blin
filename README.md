@@ -62,6 +62,14 @@ Mention `@duhon` in any PR comment with a natural language request:
 - When requested via `@duhon` mention
 - When explicitly requested as a reviewer via GitHub UI
 
+#### Review plan
+Follows a fixed plan and submits one final review summarising the general findings (plus inline comments for line-level issues):
+1. Understand the PR from its description and verify it actually fixes the described problem — _blocks merge if it doesn't_
+2. Compare with how it would fix the problem itself; suggest an alternative only if substantially better (non-blocking)
+3. Critical line-level review against the project conventions — inline comments _block merge_
+4. Verify CI tests ran and passed — _blocks merge if they failed_
+5. Verify a test covering the fix is added/updated (non-blocking note if missing)
+
 #### Discuss
 - Reply to comments in review threads
 

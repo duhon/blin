@@ -114,6 +114,29 @@ export function getPrCommitsTool(ctx: GitHubToolContext): AgentTool {
   };
 }
 
+/** The CI check runs on the PR head commit and their conclusions — to see whether tests ran and passed. */
+export function getPrChecksTool(ctx: GitHubToolContext): AgentTool {
+  return {
+    name: 'get_pr_checks',
+    description: 'The CI check runs on the PR head commit with their status and conclusion (success/failure/…). Use it to verify the tests actually ran and passed.',
+    inputSchema: { type: 'object', properties: {} },
+    async run(): Promise<string> {
+      try {
+        const { data } = await ctx.octokit.request('GET /repos/{owner}/{repo}/commits/{ref}/check-runs', {
+          owner: ctx.owner, repo: ctx.repo, ref: ctx.ref, per_page: 100,
+        });
+        if (!data.check_runs.length) return 'No check runs found on the head commit — tests may not have run.';
+        const lines = data.check_runs.map((c: any) => `${c.name}: ${c.status}${c.conclusion ? ` → ${c.conclusion}` : ''}`);
+        const failed = data.check_runs.filter((c: any) => c.conclusion === 'failure').length;
+        const pending = data.check_runs.filter((c: any) => c.status !== 'completed').length;
+        return `${data.check_runs.length} checks (${failed} failed, ${pending} still running):\n${lines.join('\n')}`;
+      } catch (e: any) {
+        return `Could not fetch PR checks: ${e?.status ?? e?.message ?? e}`;
+      }
+    },
+  };
+}
+
 /** Read a slice of a file at the context ref, returned with line numbers. */
 export function readFileTool(ctx: GitHubToolContext, opts: ReadFileOptions = {}): AgentTool {
   const defaultLimit = opts.defaultLimit ?? DEFAULT_READ_LIMIT;

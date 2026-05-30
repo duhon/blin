@@ -77,6 +77,18 @@ export default `
 - Integration tests for repository/resource model layer
 - MFTF for end-to-end admin/frontend flows
 
+## Expected CI checks
+A Magento PR is expected to run this set of checks. When verifying CI (review-plan step 4), compare the actual checks from get_pr_checks against this list and flag any that are missing as well as any that failed. Names often carry an edition/version suffix (e.g. "Static Tests (2.4.7-p10-develop)"), so match by prefix — the same logical check may appear several times for different versions/editions.
+- Integration Tests
+- Static Tests
+- WebAPI Tests
+- Adobe CLA Signed?
+- Database Compare
+- Magento Health Index
+- metadata-check
+- Preliminary Checks
+- Semantic Version Checker
+
 ### Common Anti-patterns to Flag
 - \`ObjectManager::getInstance()\` outside of factories — hard to test, bypasses DI
 - \`$collection->load()\` inside loops — N+1 query problem
