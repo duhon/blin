@@ -4596,6 +4596,15 @@ Apply the project conventions; for genuinely [critical] issues call create_inlin
 - Post ONLY [critical] issues (crash/outage/data loss/security breach).
 - NEVER [major]/[minor] unless the conventions say otherwise. When in doubt \u2014 skip.
 
+### Inline comment format
+Keep inline comments MINIMAL \u2014 just the claim and a short fix. No explanation, no impact analysis, no bullet lists: if the reviewer wants details, they will ask in the thread. Every create_inline_comment body must be exactly this shape (GitHub markdown), and nothing else. Start with the \u{1F534} marker (all posted inline issues are critical), not the text "[critical]":
+
+\u{1F534} **<one short line stating what is wrong \u2014 the claim only, no explanation>**
+
+**Fix:** <the fix in one short line>. For a direct line replacement, add a GitHub \`suggestion\` code block (a triple-backtick fence tagged "suggestion") so the author can apply it in one click \u2014 never put a suggestion block inside collapsed content.
+
+Two lines only (plus an optional suggestion block). Do not add a problem description, and do not paste diff/hunk headers or [RIGHT:N]/[LEFT:N] annotations.
+
 ## Step 4 \u2014 CI checks (section: "ci")
 Use get_pr_checks and compare against the expected CI check set in the project conventions (match by name prefix; ignore version/edition suffixes).
 - A required check FAILED or is entirely MISSING / no runs at all \u2192 status "blocking", headline e.g. "no runs found" or "Static Tests failed". The detail MUST be a markdown LIST of the expected checks that are missing or failed (one per line, "- Name"), not prose.
