@@ -95,6 +95,15 @@ export interface ReviewThreadReplyEvent {
   installationId: number;
 }
 
+/** A PR was closed (merged or not). Used to learn retrospectively from the whole review. */
+export interface PrClosedEvent {
+  type: 'pr.closed';
+  repo: Repository;
+  pr: PullRequest;
+  merged: boolean;
+  installationId: number;
+}
+
 // Release Manager
 export interface ReleaseRequestedEvent {
   type: 'release.requested';
@@ -123,6 +132,7 @@ export type BlinEvent =
   | ReleaseRequestedEvent
   | EnvironmentRequestedEvent
   | PrMentionEvent
-  | ReviewThreadReplyEvent;
+  | ReviewThreadReplyEvent
+  | PrClosedEvent;
 
 export type EventType = BlinEvent['type'];

@@ -3914,6 +3914,16 @@ async function handlePullRequest(event, bus) {
     };
     await bus.publish(analystEvent);
   }
+  if (payload.action === "closed") {
+    const closedEvent = {
+      type: "pr.closed",
+      repo: extractRepo(payload),
+      pr: extractPr(payload.pull_request),
+      merged: !!payload.pull_request.merged,
+      installationId: payload.installation.id
+    };
+    await bus.publish(closedEvent);
+  }
 }
 async function handleIssueComment(event, bus) {
   const { payload } = event;
@@ -4325,6 +4335,60 @@ function getPrChecksTool(ctx) {
 ${lines.join("\n")}`;
       } catch (e) {
         return `Could not fetch PR checks: ${e?.status ?? e?.message ?? e}`;
+      }
+    }
+  };
+}
+function getPrReviewsTool(ctx) {
+  return {
+    name: "get_pr_reviews",
+    description: "The submitted reviews on the PR, each with its author, state (APPROVED/CHANGES_REQUESTED/COMMENTED) and summary body.",
+    inputSchema: { type: "object", properties: {} },
+    async run() {
+      try {
+        const { data } = await ctx.octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews", {
+          owner: ctx.owner,
+          repo: ctx.repo,
+          pull_number: ctx.prNumber,
+          per_page: 100
+        });
+        if (!data.length)
+          return "No formal reviews submitted.";
+        return data.filter((r) => r.state !== "PENDING").map((r) => `@${r.user?.login} \u2014 ${r.state}${r.body ? `: ${r.body.slice(0, 500)}` : ""}`).join("\n\n");
+      } catch (e) {
+        return `Could not fetch reviews: ${e?.status ?? e?.message ?? e}`;
+      }
+    }
+  };
+}
+function getReviewCommentsTool(ctx) {
+  return {
+    name: "get_review_comments",
+    description: "All inline review-comment threads on the PR (root comment plus replies), grouped by file:line \u2014 the conversations to learn from.",
+    inputSchema: { type: "object", properties: {} },
+    async run() {
+      try {
+        const { data } = await ctx.octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}/comments", {
+          owner: ctx.owner,
+          repo: ctx.repo,
+          pull_number: ctx.prNumber,
+          per_page: 100
+        });
+        if (!data.length)
+          return "No inline review comments.";
+        const roots = /* @__PURE__ */ new Map();
+        for (const c of data) {
+          const rootId = c.in_reply_to_id ?? c.id;
+          (roots.get(rootId) ?? roots.set(rootId, []).get(rootId)).push(c);
+        }
+        return [...roots.values()].map((thread) => {
+          const head = thread[0];
+          const convo = thread.map((c) => `  @${c.user?.login}: ${c.body}`).join("\n");
+          return `Thread on ${head.path}:${head.line ?? head.original_line ?? "?"}
+${convo}`;
+        }).join("\n\n---\n\n");
+      } catch (e) {
+        return `Could not fetch review comments: ${e?.status ?? e?.message ?? e}`;
       }
     }
   };
@@ -4925,6 +4989,23 @@ Rules for inline comments:
 - Comment body is rendered as GitHub markdown \u2014 write human prose, not raw diff syntax. NEVER paste \`@@ ... @@\` hunk headers, \`---\`/\`+++\` file headers, or \`[RIGHT:N]\`/\`[LEFT:N]\` annotations into the body. If you need to quote code, use a normal markdown code block
 
 When done reviewing, say "Review complete." and stop calling tools.`;
+var LEARN_TOOL_NAMES = /* @__PURE__ */ new Set(["get_project_conventions", "get_pr_diff", "read_file", "save_repo_memory"]);
+var LEARN_TOOLS = TOOLS.filter((t) => LEARN_TOOL_NAMES.has(t.toolSpec.name));
+var LEARN_SYSTEM_PROMPT = `A pull request was just CLOSED. Learn from the whole review retrospectively and persist a reusable lesson for future reviews of this repo. You do NOT post anything to the PR.
+
+The user message tells you whether the PR was MERGED (changes accepted) or closed WITHOUT merge (changes rejected) \u2014 that is the ground-truth outcome.
+
+Steps:
+1. get_project_conventions \u2014 read the current conventions and accumulated memory, so you MERGE rather than duplicate.
+2. Gather the review: get_pr_reviews (verdicts), get_review_comments (the inline threads/conversations), get_pr_diff and read_file as needed to understand the code.
+3. Infer the lessons:
+   - Findings that were addressed/fixed (especially in a MERGED PR) \u2192 what kind of problem gets fixed here \u2192 "## Patterns to watch" / "## Conventions".
+   - Findings dismissed as unnecessary (valid counter-argument, or agreed fine) \u2192 "## False positives \u2014 do not flag" so future reviews stop raising them.
+   - HUMAN-to-human review discussions are the HIGHEST-VALUE signal \u2014 prioritize learning from them.
+   - A merged PR's accepted patterns are good; a rejected (closed-unmerged) PR's approach is a cautionary signal.
+4. save_repo_memory with the MERGED memory in the strict four-section format \u2014 keep all existing content, only add or refine.
+
+Record GENERAL, reusable lessons, not one-off specifics. If there is nothing generalizable to learn, do not call save_repo_memory and just stop.`;
 async function loadDiffMap(ctx) {
   const { data } = await ctx.octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
     owner: ctx.owner,
@@ -5338,6 +5419,52 @@ Respond to their reply.`;
     } else {
       console.log(`[reviewer][thread] reply posted on PR #${event.pr.number}`);
     }
+  });
+  bus.subscribe("pr.closed", async (event) => {
+    console.log(`[reviewer] PR #${event.pr.number} closed (merged=${event.merged}) \u2014 learning`);
+    if (!MEMORY_BUCKET) {
+      console.log(`[reviewer] BLIN_MEMORY_BUCKET not set \u2014 cannot learn, skipping`);
+      return;
+    }
+    const octokit = await githubApp.getInstallationOctokit(event.installationId);
+    let prData;
+    try {
+      ({ data: prData } = await octokit.request("GET /repos/{owner}/{repo}/pulls/{pull_number}", {
+        owner: event.repo.owner,
+        repo: event.repo.name,
+        pull_number: event.pr.number
+      }));
+    } catch (err) {
+      console.error(`[reviewer] learn: failed to fetch PR #${event.pr.number}:`, err);
+      return;
+    }
+    const ctx = {
+      octokit,
+      owner: event.repo.owner,
+      repo: event.repo.name,
+      pullNumber: event.pr.number,
+      headSha: prData.head.sha,
+      defaultBranch: prData.base.repo.default_branch,
+      pat: process.env.GITHUB_REVIEWER_PAT,
+      pr: { title: event.pr.title, body: event.pr.body, base: prData.base.ref, head: prData.head.ref },
+      diffMap: null,
+      commentsPosted: 0,
+      reviewNotes: []
+    };
+    const toolCtx = { octokit, owner: ctx.owner, repo: ctx.repo, prNumber: ctx.pullNumber, ref: ctx.headSha };
+    const request2 = `PR #${event.pr.number} "${event.pr.title}" was just closed \u2014 ${event.merged ? "MERGED (changes accepted)" : "CLOSED WITHOUT MERGE (changes rejected)"}.
+
+Review the whole PR retrospectively with the tools and update the repo memory with what you learn.`;
+    const agent = new BedrockAgent({ logPrefix: `[reviewer] learn PR #${event.pr.number}`, maxIterations: MAX_ITERATIONS });
+    await agent.run({
+      instructions: LEARN_SYSTEM_PROMPT,
+      request: request2,
+      tools: [
+        ...toAgentTools(LEARN_TOOLS, (name, input) => executeTool(name, input, ctx)),
+        getPrReviewsTool(toolCtx),
+        getReviewCommentsTool(toolCtx)
+      ]
+    });
   });
 }
 

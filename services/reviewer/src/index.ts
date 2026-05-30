@@ -1,8 +1,8 @@
 import { GetObjectCommand, PutObjectCommand, S3Client } from '@aws-sdk/client-s3';
-import type { IEventBus, ReviewRequestedEvent, ReviewThreadReplyEvent } from '@blin/event-bus';
+import type { IEventBus, ReviewRequestedEvent, ReviewThreadReplyEvent, PrClosedEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
 import { BedrockAgent, type AgentTool } from '@blin/agent';
-import { getPrDescriptionTool, listPrFilesTool, getPrCommitsTool, getPrChecksTool, type GitHubToolContext } from '@blin/github-tools';
+import { getPrDescriptionTool, listPrFilesTool, getPrCommitsTool, getPrChecksTool, getPrReviewsTool, getReviewCommentsTool, type GitHubToolContext } from '@blin/github-tools';
 import { knowledgePacks } from './knowledge/index.js';
 
 const s3 = new S3Client({});
@@ -317,6 +317,26 @@ Rules for inline comments:
 - Comment body is rendered as GitHub markdown — write human prose, not raw diff syntax. NEVER paste \`@@ ... @@\` hunk headers, \`---\`/\`+++\` file headers, or \`[RIGHT:N]\`/\`[LEFT:N]\` annotations into the body. If you need to quote code, use a normal markdown code block
 
 When done reviewing, say "Review complete." and stop calling tools.`;
+
+// Tools used when learning retrospectively from a closed PR (read-only + memory write).
+const LEARN_TOOL_NAMES = new Set(['get_project_conventions', 'get_pr_diff', 'read_file', 'save_repo_memory']);
+const LEARN_TOOLS = TOOLS.filter((t) => LEARN_TOOL_NAMES.has(t.toolSpec.name));
+
+const LEARN_SYSTEM_PROMPT = `A pull request was just CLOSED. Learn from the whole review retrospectively and persist a reusable lesson for future reviews of this repo. You do NOT post anything to the PR.
+
+The user message tells you whether the PR was MERGED (changes accepted) or closed WITHOUT merge (changes rejected) — that is the ground-truth outcome.
+
+Steps:
+1. get_project_conventions — read the current conventions and accumulated memory, so you MERGE rather than duplicate.
+2. Gather the review: get_pr_reviews (verdicts), get_review_comments (the inline threads/conversations), get_pr_diff and read_file as needed to understand the code.
+3. Infer the lessons:
+   - Findings that were addressed/fixed (especially in a MERGED PR) → what kind of problem gets fixed here → "## Patterns to watch" / "## Conventions".
+   - Findings dismissed as unnecessary (valid counter-argument, or agreed fine) → "## False positives — do not flag" so future reviews stop raising them.
+   - HUMAN-to-human review discussions are the HIGHEST-VALUE signal — prioritize learning from them.
+   - A merged PR's accepted patterns are good; a rejected (closed-unmerged) PR's approach is a cautionary signal.
+4. save_repo_memory with the MERGED memory in the strict four-section format — keep all existing content, only add or refine.
+
+Record GENERAL, reusable lessons, not one-off specifics. If there is nothing generalizable to learn, do not call save_repo_memory and just stop.`;
 
 interface ReviewContext {
   octokit: any;
@@ -800,5 +820,59 @@ Respond to their reply.`;
     } else {
       console.log(`[reviewer][thread] reply posted on PR #${event.pr.number}`);
     }
+  });
+
+  // Learn retrospectively from a closed PR: look at the reviews, threads, diff
+  // and the merged/rejected outcome, distill reusable lessons, and merge them
+  // into the repo memory. Posts nothing to the PR.
+  bus.subscribe<PrClosedEvent>('pr.closed', async (event) => {
+    console.log(`[reviewer] PR #${event.pr.number} closed (merged=${event.merged}) — learning`);
+    if (!MEMORY_BUCKET) {
+      console.log(`[reviewer] BLIN_MEMORY_BUCKET not set — cannot learn, skipping`);
+      return;
+    }
+
+    const octokit = await githubApp.getInstallationOctokit(event.installationId);
+    let prData: any;
+    try {
+      ({ data: prData } = await octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}', {
+        owner: event.repo.owner,
+        repo: event.repo.name,
+        pull_number: event.pr.number,
+      }));
+    } catch (err) {
+      console.error(`[reviewer] learn: failed to fetch PR #${event.pr.number}:`, err);
+      return;
+    }
+
+    const ctx: ReviewContext = {
+      octokit,
+      owner: event.repo.owner,
+      repo: event.repo.name,
+      pullNumber: event.pr.number,
+      headSha: prData.head.sha,
+      defaultBranch: prData.base.repo.default_branch,
+      pat: process.env.GITHUB_REVIEWER_PAT,
+      pr: { title: event.pr.title, body: event.pr.body, base: prData.base.ref, head: prData.head.ref },
+      diffMap: null,
+      commentsPosted: 0,
+      reviewNotes: [],
+    };
+    const toolCtx: GitHubToolContext = { octokit, owner: ctx.owner, repo: ctx.repo, prNumber: ctx.pullNumber, ref: ctx.headSha };
+
+    const request =
+      `PR #${event.pr.number} "${event.pr.title}" was just closed — ${event.merged ? 'MERGED (changes accepted)' : 'CLOSED WITHOUT MERGE (changes rejected)'}.\n\n` +
+      `Review the whole PR retrospectively with the tools and update the repo memory with what you learn.`;
+
+    const agent = new BedrockAgent({ logPrefix: `[reviewer] learn PR #${event.pr.number}`, maxIterations: MAX_ITERATIONS });
+    await agent.run({
+      instructions: LEARN_SYSTEM_PROMPT,
+      request,
+      tools: [
+        ...toAgentTools(LEARN_TOOLS, (name, input) => executeTool(name, input, ctx)),
+        getPrReviewsTool(toolCtx),
+        getReviewCommentsTool(toolCtx),
+      ],
+    });
   });
 }

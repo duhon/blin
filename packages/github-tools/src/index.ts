@@ -137,6 +137,61 @@ export function getPrChecksTool(ctx: GitHubToolContext): AgentTool {
   };
 }
 
+/** The submitted reviews on the PR and their verdicts (APPROVED / CHANGES_REQUESTED / COMMENTED). */
+export function getPrReviewsTool(ctx: GitHubToolContext): AgentTool {
+  return {
+    name: 'get_pr_reviews',
+    description: 'The submitted reviews on the PR, each with its author, state (APPROVED/CHANGES_REQUESTED/COMMENTED) and summary body.',
+    inputSchema: { type: 'object', properties: {} },
+    async run(): Promise<string> {
+      try {
+        const { data } = await ctx.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/reviews', {
+          owner: ctx.owner, repo: ctx.repo, pull_number: ctx.prNumber, per_page: 100,
+        });
+        if (!data.length) return 'No formal reviews submitted.';
+        return data
+          .filter((r: any) => r.state !== 'PENDING')
+          .map((r: any) => `@${r.user?.login} — ${r.state}${r.body ? `: ${r.body.slice(0, 500)}` : ''}`)
+          .join('\n\n');
+      } catch (e: any) {
+        return `Could not fetch reviews: ${e?.status ?? e?.message ?? e}`;
+      }
+    },
+  };
+}
+
+/** All inline review comments on the PR, grouped into threads (root + replies) by file:line. */
+export function getReviewCommentsTool(ctx: GitHubToolContext): AgentTool {
+  return {
+    name: 'get_review_comments',
+    description: 'All inline review-comment threads on the PR (root comment plus replies), grouped by file:line — the conversations to learn from.',
+    inputSchema: { type: 'object', properties: {} },
+    async run(): Promise<string> {
+      try {
+        const { data } = await ctx.octokit.request('GET /repos/{owner}/{repo}/pulls/{pull_number}/comments', {
+          owner: ctx.owner, repo: ctx.repo, pull_number: ctx.prNumber, per_page: 100,
+        });
+        if (!data.length) return 'No inline review comments.';
+        // Group replies under their root (in_reply_to_id), preserving order.
+        const roots = new Map<number, any[]>();
+        for (const c of data) {
+          const rootId = c.in_reply_to_id ?? c.id;
+          (roots.get(rootId) ?? roots.set(rootId, []).get(rootId)!).push(c);
+        }
+        return [...roots.values()]
+          .map((thread) => {
+            const head = thread[0];
+            const convo = thread.map((c: any) => `  @${c.user?.login}: ${c.body}`).join('\n');
+            return `Thread on ${head.path}:${head.line ?? head.original_line ?? '?'}\n${convo}`;
+          })
+          .join('\n\n---\n\n');
+      } catch (e: any) {
+        return `Could not fetch review comments: ${e?.status ?? e?.message ?? e}`;
+      }
+    },
+  };
+}
+
 /** Read a slice of a file at the context ref, returned with line numbers. */
 export function readFileTool(ctx: GitHubToolContext, opts: ReadFileOptions = {}): AgentTool {
   const defaultLimit = opts.defaultLimit ?? DEFAULT_READ_LIMIT;

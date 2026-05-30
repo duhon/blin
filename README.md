@@ -73,6 +73,9 @@ Follows a fixed plan and submits one final review summarising the general findin
 #### Discuss
 - Reply to comments in review threads
 
+#### Learn
+- When a PR is closed, learn retrospectively from the whole review: the submitted verdicts, the inline-comment threads, the diff, and whether it was **merged (accepted)** or **closed without merge (rejected)**. Distil reusable lessons into the repo memory — what gets fixed, what was dismissed (so future reviews stop re-flagging it), with human-to-human discussions weighted highest.
+
 ---
 
 ### Analyst
