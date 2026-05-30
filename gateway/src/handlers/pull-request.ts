@@ -1,4 +1,4 @@
-import type { IEventBus, ReviewRequestedEvent, AnalystQuestionAskedEvent, PrMentionEvent, PrClosedEvent } from '@blin/event-bus';
+import type { IEventBus, ReviewRequestedEvent, PrMentionEvent, PrClosedEvent } from '@blin/event-bus';
 import type { EmitterWebhookEvent } from '@octokit/webhooks';
 
 type PullRequestEvent = EmitterWebhookEvent<'pull_request'>;
@@ -41,19 +41,6 @@ export async function handlePullRequest(
       installationId: payload.installation!.id,
     };
     await bus.publish(reviewEvent);
-  }
-
-  if (payload.action === 'opened') {
-    const analystEvent: AnalystQuestionAskedEvent = {
-      type: 'analyst.question_asked',
-      repo: extractRepo(payload),
-      pr: extractPr(payload.pull_request),
-      commentId: 0,
-      question: '',
-      askedBy: payload.sender.login,
-      installationId: payload.installation!.id,
-    };
-    await bus.publish(analystEvent);
   }
 
   if (payload.action === 'closed') {

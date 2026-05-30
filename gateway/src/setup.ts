@@ -4,7 +4,6 @@ import { InMemoryEventBus } from '@blin/event-bus';
 import { registerWebhookHandlers } from './router.js';
 import { register as registerButler } from '@blin/butler';
 import { register as registerReviewer } from '@blin/reviewer';
-import { register as registerAnalyst } from '@blin/analyst';
 import { register as registerTester } from '@blin/tester';
 import { register as registerReleaseManager } from '@blin/release-manager';
 import { register as registerEnvironmentManager } from '@blin/environment-manager';
@@ -27,7 +26,6 @@ export function createWebhooks(): Webhooks {
   registerWebhookHandlers(webhooks, bus);
   registerButler(bus, githubApp);
   registerReviewer(bus, githubApp);
-  registerAnalyst(bus, githubApp);
   registerTester(bus, githubApp);
   registerReleaseManager(bus, githubApp);
   registerEnvironmentManager(bus, githubApp);

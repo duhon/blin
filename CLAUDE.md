@@ -16,7 +16,6 @@ blin/
 ├── gateway/              # Webhook receiver (Express + Octokit)
 ├── services/
 │   ├── reviewer/         # Posts PR reviews
-│   ├── analyst/          # Creates GitHub Discussions for PRs
 │   ├── tester/           # Analyzes CI failures
 │   ├── release-manager/  # Generates release notes, creates tags
 │   └── environment-manager/  # Creates Codespace preview environments
@@ -29,7 +28,6 @@ blin/
 - **npm workspaces** — monorepo management
 - **InMemoryEventBus** — simple for now, IEventBus interface allows swapping to Redis/RabbitMQ later
 - **All services run in one process** during mock/dev phase
-- **GitHub Discussions** — used by Analyst service instead of PR comments (keeps PRs clean)
 - **GitHub Deployments API** — used by Environment Manager and Release Manager
 
 ## Current state

@@ -1,17 +1,16 @@
-import type { IEventBus, PrMentionEvent, ReviewRequestedEvent, AnalystQuestionAskedEvent, ReviewThreadReplyEvent, TestAnalysisRequestedEvent } from '@blin/event-bus';
+import type { IEventBus, PrMentionEvent, ReviewRequestedEvent, ReviewThreadReplyEvent, TestAnalysisRequestedEvent } from '@blin/event-bus';
 import type { App } from '@octokit/app';
 import { BedrockAgent } from '@blin/agent';
 
 const DISPATCHER_INSTRUCTIONS = `You are a dispatcher for a GitHub bot. Classify the user's intent from their PR comment.
 Reply with exactly one word:
 - "review" — user wants a code review of the PR
-- "question" — user is asking a question about the code, the PR, or how something works
 - "tests" — user wants to know why the CI tests/checks are failing or wants the failing tests analyzed
 - "unknown" — anything else`;
 
 const dispatcher = new BedrockAgent({ logPrefix: '[butler]', maxIterations: 1 });
 
-async function classifyIntent(comment: string): Promise<'review' | 'question' | 'tests' | 'unknown'> {
+async function classifyIntent(comment: string): Promise<'review' | 'tests' | 'unknown'> {
   let text = '';
   try {
     const result = await dispatcher.run({ instructions: DISPATCHER_INSTRUCTIONS, request: comment });
@@ -23,7 +22,6 @@ async function classifyIntent(comment: string): Promise<'review' | 'question' | 
   console.log(`[butler] classified "${comment.slice(0, 80)}" → ${text}`);
 
   if (text.startsWith('review')) return 'review';
-  if (text.startsWith('question')) return 'question';
   if (text.startsWith('tests')) return 'tests';
   return 'unknown';
 }
@@ -110,19 +108,6 @@ export function register(bus: IEventBus, githubApp: App): void {
       return;
     }
 
-    if (intent === 'question') {
-      const questionEvent: AnalystQuestionAskedEvent = {
-        type: 'analyst.question_asked',
-        repo: event.repo,
-        pr: event.pr,
-        commentId: event.commentId,
-        question: event.comment,
-        askedBy: event.author,
-        installationId: event.installationId,
-      };
-      await bus.publish(questionEvent);
-      return;
-    }
 
     console.log(`[butler] unknown intent, ignoring`);
   });

@@ -3902,18 +3902,6 @@ async function handlePullRequest(event, bus) {
     };
     await bus.publish(reviewEvent);
   }
-  if (payload.action === "opened") {
-    const analystEvent = {
-      type: "analyst.question_asked",
-      repo: extractRepo(payload),
-      pr: extractPr(payload.pull_request),
-      commentId: 0,
-      question: "",
-      askedBy: payload.sender.login,
-      installationId: payload.installation.id
-    };
-    await bus.publish(analystEvent);
-  }
   if (payload.action === "closed") {
     const closedEvent = {
       type: "pr.closed",
@@ -4111,7 +4099,6 @@ ${req.context}` : req.instructions;
 var DISPATCHER_INSTRUCTIONS = `You are a dispatcher for a GitHub bot. Classify the user's intent from their PR comment.
 Reply with exactly one word:
 - "review" \u2014 user wants a code review of the PR
-- "question" \u2014 user is asking a question about the code, the PR, or how something works
 - "tests" \u2014 user wants to know why the CI tests/checks are failing or wants the failing tests analyzed
 - "unknown" \u2014 anything else`;
 var dispatcher = new BedrockAgent({ logPrefix: "[butler]", maxIterations: 1 });
@@ -4127,8 +4114,6 @@ async function classifyIntent(comment) {
   console.log(`[butler] classified "${comment.slice(0, 80)}" \u2192 ${text}`);
   if (text.startsWith("review"))
     return "review";
-  if (text.startsWith("question"))
-    return "question";
   if (text.startsWith("tests"))
     return "tests";
   return "unknown";
@@ -4199,19 +4184,6 @@ function register2(bus, githubApp) {
         installationId: event.installationId
       };
       await bus.publish(testsEvent);
-      return;
-    }
-    if (intent === "question") {
-      const questionEvent = {
-        type: "analyst.question_asked",
-        repo: event.repo,
-        pr: event.pr,
-        commentId: event.commentId,
-        question: event.comment,
-        askedBy: event.author,
-        installationId: event.installationId
-      };
-      await bus.publish(questionEvent);
       return;
     }
     console.log(`[butler] unknown intent, ignoring`);
@@ -5515,14 +5487,6 @@ Review the whole PR retrospectively with the tools and update the repo memory wi
   });
 }
 
-// ../services/analyst/dist/index.js
-function register4(bus, githubApp) {
-  bus.subscribe("analyst.question_asked", async (event) => {
-    console.log(`[analyst] question in PR #${event.pr.number} from ${event.askedBy}`);
-    console.log(`[analyst] would create discussion for PR #${event.pr.number} (mock)`);
-  });
-}
-
 // ../services/tester/dist/index.js
 var MAX_ITERATIONS2 = 8;
 var MAX_FAILURES = 10;
@@ -5717,7 +5681,7 @@ ${detailsBody}
   console.log(`[tester] posted failure analysis for "${checkRunName}" on PR #${prNumber}`);
   return true;
 }
-function register5(bus, githubApp) {
+function register4(bus, githubApp) {
   bus.subscribe("tests.check_run_completed", async (event) => {
     if (event.conclusion !== "failure") {
       console.log(`[tester] check run ${event.checkRunName} concluded ${event.conclusion}, skipping`);
@@ -5776,7 +5740,7 @@ No failing checks on the latest commit (\`${pr.head.sha.slice(0, 7)}\`) \u2014 e
 }
 
 // ../services/release-manager/dist/index.js
-function register6(bus, githubApp) {
+function register5(bus, githubApp) {
   bus.subscribe("release.requested", async (event) => {
     console.log(`[release-manager] release ${event.version} requested in ${event.repo.fullName}`);
     console.log(`[release-manager] would create release ${event.version} (mock)`);
@@ -5784,7 +5748,7 @@ function register6(bus, githubApp) {
 }
 
 // ../services/environment-manager/dist/index.js
-function register7(bus, githubApp) {
+function register6(bus, githubApp) {
   bus.subscribe("environment.requested", async (event) => {
     console.log(`[environment-manager] preview requested for PR #${event.pr.number}`);
     console.log(`[environment-manager] would create deployment for PR #${event.pr.number} (mock)`);
@@ -5807,7 +5771,6 @@ function createWebhooks() {
   register4(bus, githubApp);
   register5(bus, githubApp);
   register6(bus, githubApp);
-  register7(bus, githubApp);
   return webhooks3;
 }
 

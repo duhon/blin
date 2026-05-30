@@ -35,17 +35,6 @@ export interface ReviewCommentCreatedEvent {
   installationId: number;
 }
 
-// Analyst
-export interface AnalystQuestionAskedEvent {
-  type: 'analyst.question_asked';
-  repo: Repository;
-  pr: PullRequest;
-  commentId: number;
-  question: string;
-  askedBy: string;
-  installationId: number;
-}
-
 // Tester
 export interface TestsRunRequestedEvent {
   type: 'tests.run_requested';
@@ -125,7 +114,6 @@ export interface EnvironmentRequestedEvent {
 export type BlinEvent =
   | ReviewRequestedEvent
   | ReviewCommentCreatedEvent
-  | AnalystQuestionAskedEvent
   | TestsRunRequestedEvent
   | CheckRunCompletedEvent
   | TestAnalysisRequestedEvent
