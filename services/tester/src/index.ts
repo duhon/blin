@@ -196,13 +196,10 @@ async function postNoReportNote(
   summary: string,
 ): Promise<void> {
   const link = checkUrl ? `[${checkRunName}](${checkUrl})` : checkRunName;
-  const verdict = summary
-    ? summary.split('\n')[0].slice(0, 200)
+  const reason = summary
+    ? summary.slice(0, 1500)
     : 'Failed, but produced no test report — open the check for details.';
-  const detail = `${summary ? `${summary.slice(0, 1500)}\n\n` : ''}**Check:** ${link}`;
-  const body =
-    `🧪 **Check failed — ${checkRunName}**\n\n${verdict}\n\n` +
-    `<details>\n<summary>Details</summary>\n\n${detail}\n\n</details>`;
+  const body = `🧪 **Check failed — ${checkRunName}**\n\n${reason}\n\n**Check:** ${link}`;
   await postComment(repo, prNumber, body);
   console.log(`[tester] posted no-report note for "${checkRunName}" on PR #${prNumber}`);
 }

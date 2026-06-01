@@ -5600,20 +5600,12 @@ async function postComment(repo, prNumber, body) {
 }
 async function postNoReportNote(repo, prNumber, checkRunName, checkUrl, summary) {
   const link = checkUrl ? `[${checkRunName}](${checkUrl})` : checkRunName;
-  const verdict = summary ? summary.split("\n")[0].slice(0, 200) : "Failed, but produced no test report \u2014 open the check for details.";
-  const detail = `${summary ? `${summary.slice(0, 1500)}
-
-` : ""}**Check:** ${link}`;
+  const reason = summary ? summary.slice(0, 1500) : "Failed, but produced no test report \u2014 open the check for details.";
   const body = `\u{1F9EA} **Check failed \u2014 ${checkRunName}**
 
-${verdict}
+${reason}
 
-<details>
-<summary>Details</summary>
-
-${detail}
-
-</details>`;
+**Check:** ${link}`;
   await postComment(repo, prNumber, body);
   console.log(`[tester] posted no-report note for "${checkRunName}" on PR #${prNumber}`);
 }
