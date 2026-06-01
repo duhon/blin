@@ -5598,11 +5598,30 @@ async function postComment(repo, prNumber, body) {
     console.error(`[tester] failed to post comment on PR #${prNumber} (${res.status}): ${await res.text()}`);
   }
 }
+async function postNoReportNote(repo, prNumber, checkRunName, checkUrl, summary) {
+  const link = checkUrl ? `[${checkRunName}](${checkUrl})` : checkRunName;
+  const verdict = summary ? summary.split("\n")[0].slice(0, 200) : "Failed, but produced no test report \u2014 open the check for details.";
+  const detail = `${summary ? `${summary.slice(0, 1500)}
+
+` : ""}**Check:** ${link}`;
+  const body = `\u{1F9EA} **Check failed \u2014 ${checkRunName}**
+
+${verdict}
+
+<details>
+<summary>Details</summary>
+
+${detail}
+
+</details>`;
+  await postComment(repo, prNumber, body);
+  console.log(`[tester] posted no-report note for "${checkRunName}" on PR #${prNumber}`);
+}
 async function analyzeAndPost(octokit, repo, ref, prNumber, checkRunName, checkUrl, output) {
   const logUrl = findConsoleLogUrl(output.summary ?? "");
   if (!logUrl) {
-    console.log(`[tester] no console-error-logs link in "${checkRunName}", skipping (non-PHPUnit check)`);
-    return false;
+    await postNoReportNote(repo, prNumber, checkRunName, checkUrl, (output.summary ?? "").trim());
+    return true;
   }
   let failures;
   try {

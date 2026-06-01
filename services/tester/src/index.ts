@@ -184,6 +184,30 @@ async function postComment(
 }
 
 /**
+ * A failed check with no PHPUnit report (build failed before tests ran, infra
+ * error, or a non-PHPUnit check). Post a short note so the bot never stays
+ * silent — always linking the check; including its summary only when present.
+ */
+async function postNoReportNote(
+  repo: { owner: string; name: string },
+  prNumber: number,
+  checkRunName: string,
+  checkUrl: string,
+  summary: string,
+): Promise<void> {
+  const link = checkUrl ? `[${checkRunName}](${checkUrl})` : checkRunName;
+  const verdict = summary
+    ? summary.split('\n')[0].slice(0, 200)
+    : 'Failed, but produced no test report — open the check for details.';
+  const detail = `${summary ? `${summary.slice(0, 1500)}\n\n` : ''}**Check:** ${link}`;
+  const body =
+    `🧪 **Check failed — ${checkRunName}**\n\n${verdict}\n\n` +
+    `<details>\n<summary>Details</summary>\n\n${detail}\n\n</details>`;
+  await postComment(repo, prNumber, body);
+  console.log(`[tester] posted no-report note for "${checkRunName}" on PR #${prNumber}`);
+}
+
+/**
  * Analyze one failed check run's PHPUnit report — investigating the repo via an
  * agent loop — and post the result as a PR comment. Returns true if a comment
  * was posted, false if there was nothing to analyze.
@@ -199,8 +223,12 @@ async function analyzeAndPost(
 ): Promise<boolean> {
   const logUrl = findConsoleLogUrl(output.summary ?? '');
   if (!logUrl) {
-    console.log(`[tester] no console-error-logs link in "${checkRunName}", skipping (non-PHPUnit check)`);
-    return false;
+    // No PHPUnit console-error-logs report (e.g. the build failed before tests
+    // ran, or a non-PHPUnit check). Don't go silent — post a short note from
+    // whatever the check provides. The link is always included; the summary is
+    // added only when present (it may be empty).
+    await postNoReportNote(repo, prNumber, checkRunName, checkUrl, (output.summary ?? '').trim());
+    return true;
   }
 
   let failures: TestFailure[];
